@@ -1,13 +1,25 @@
 from sys import argv
 from hashlib import md5
 # Define max allowed field sizes for each field
+MAX_PACKET_SIZE = 1000
 CHKSUM_FIELD = 16
 SEQNUM_FIELD = 2
 ACKNUM_FIELD = 2
 PAYLEN_FIELD = 2
-PAYLOAD_SIZE = 978
+PAYLOAD_SIZE = MAX_PACKET_SIZE-CHKSUM_FIELD-SEQNUM_FIELD-ACKNUM_FIELD-PAYLEN_FIELD
+
+def convertBytesOfLength(value, len):
+	return value.to_bytes(len, byteorder='little')
 
 def packetize(seq_num, ack_num, payload_len, payload):
+	if type(seq_num) is not bytes:
+		seq_num=convertBytesOfLength(seq_num, SEQNUM_FIELD)
+	if type(ack_num) is not bytes:
+		ack_num=convertBytesOfLength(ack_num, ACKNUM_FIELD)
+	if type(payload_len) is not bytes:
+		payload_len=convertBytesOfLength(payload_len, PAYLEN_FIELD)
+	if type(payload) is not bytes:
+		payload=convertBytesOfLength(payload, PAYLOAD_SIZE)
 	# Check sizes of each input
 	if(len(seq_num)!=SEQNUM_FIELD or
 		 len(ack_num)!=ACKNUM_FIELD or 
@@ -24,9 +36,6 @@ def packetize(seq_num, ack_num, payload_len, payload):
 	# Form the packet and return
 	packet=checksum+prepacket
 	return packet
-
-def convertBytesOfLength(value, len):
-	return value.to_bytes(len, byteorder='little')
 
 def parsePacket(packet):
 	# Get transmitted checksum
@@ -56,14 +65,14 @@ def parsePacket(packet):
 		# Return all of the parsed values
 		return (new_checksum.hexdigest(), seq_num, ack_num, payload_len, payload)
 
-def main(argv):
-	seq_num=convertBytesOfLength(10, SEQNUM_FIELD)
-	ack_num=convertBytesOfLength(10, ACKNUM_FIELD)
-	payload_len=convertBytesOfLength(5, PAYLEN_FIELD)
-	payload="Erkin".encode()
-	packet=packetize(seq_num, ack_num, payload_len, payload)
-	print(len(packet))
-	print(parsePacket(packet))
+# def main(argv):
+# 	seq_num=convertBytesOfLength(10, SEQNUM_FIELD)
+# 	ack_num=convertBytesOfLength(10, ACKNUM_FIELD)
+# 	payload_len=convertBytesOfLength(5, PAYLEN_FIELD)
+# 	payload="Erkin".encode()
+# 	packet=packetize(seq_num, ack_num, payload_len, payload)
+# 	print(len(packet))
+# 	print(parsePacket(packet))
 
-if __name__ == "__main__":
-    main(argv[1:])
+# if __name__ == "__main__":
+#     main(argv[1:])
