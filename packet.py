@@ -17,12 +17,8 @@ def packetize(seq_num, ack_num, payload_len, payload):
 		return None
 	# Get header without the checksum
 	preheader=seq_num+ack_num+payload_len
-	# Convert actual length of payload from bytes to int
-	pay_len_as_int=int.from_bytes(payload_len, byteorder='little')
-	# Pad the end of the payload with zero if required
-	padding=bytes(PAYLOAD_SIZE-pay_len_as_int)
 	# Get packet without the checksum
-	prepacket=preheader+payload+padding
+	prepacket=preheader+payload
 	# Find checksum in 16 bytes
 	checksum=md5(prepacket).digest()
 	# Form the packet and return
