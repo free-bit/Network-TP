@@ -7,6 +7,7 @@ SEQNUM_FIELD = 2
 ACKNUM_FIELD = 2
 PAYLEN_FIELD = 2
 PAYLOAD_SIZE = MAX_PACKET_SIZE-CHKSUM_FIELD-SEQNUM_FIELD-ACKNUM_FIELD-PAYLEN_FIELD
+MAX_ALLOWED_SEQ_NUM=2**(SEQNUM_FIELD*8)
 
 def convertBytesOfLength(value, len):
 	return value.to_bytes(len, byteorder='little')
@@ -18,7 +19,7 @@ def packetize(seq_num, ack_num, payload_len, payload):
 		ack_num=convertBytesOfLength(ack_num, ACKNUM_FIELD)
 	if type(payload_len) is not bytes:
 		payload_len=convertBytesOfLength(payload_len, PAYLEN_FIELD)
-	if type(payload) is not bytes:
+	if type(payload) is not bytearray and type(payload) is not bytes:
 		payload=convertBytesOfLength(payload, PAYLOAD_SIZE)
 	# Check sizes of each input
 	if(len(seq_num)!=SEQNUM_FIELD or
