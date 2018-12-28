@@ -1,5 +1,6 @@
 from socket import *
 from time import *
+import struct
 
 # Find fractional part of time information provided by NTP response
 def getFraction(binary_repr):

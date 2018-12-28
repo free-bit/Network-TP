@@ -1,13 +1,19 @@
 from sys import argv
 from hashlib import md5
-# Define max allowed field sizes for each field
+# Define max number pipelining
+WINDOW_SIZE=1024
+# Define max allowed field sizes in bytes for each field
 MAX_PACKET_SIZE = 1000
 CHKSUM_FIELD = 16
 SEQNUM_FIELD = 2
 ACKNUM_FIELD = 2
 PAYLEN_FIELD = 2
+HEADER_SIZE	 = CHKSUM_FIELD+SEQNUM_FIELD+ACKNUM_FIELD+PAYLEN_FIELD
 PAYLOAD_SIZE = MAX_PACKET_SIZE-CHKSUM_FIELD-SEQNUM_FIELD-ACKNUM_FIELD-PAYLEN_FIELD
 MAX_ALLOWED_SEQ_NUM=2**(SEQNUM_FIELD*8)
+# Define max allowed size in bytes for epoch time
+MAX_INTEGER = 4
+MAX_DECIMAL = 4
 
 def convertBytesOfLength(value, len):
 	return value.to_bytes(len, byteorder='little')
@@ -66,14 +72,5 @@ def parsePacket(packet):
 		# Return all of the parsed values
 		return (new_checksum.hexdigest(), seq_num, ack_num, payload_len, payload)
 
-# def main(argv):
-# 	seq_num=convertBytesOfLength(10, SEQNUM_FIELD)
-# 	ack_num=convertBytesOfLength(10, ACKNUM_FIELD)
-# 	payload_len=convertBytesOfLength(5, PAYLEN_FIELD)
-# 	payload="Erkin".encode()
-# 	packet=packetize(seq_num, ack_num, payload_len, payload)
-# 	print(len(packet))
-# 	print(parsePacket(packet))
-
-# if __name__ == "__main__":
-#     main(argv[1:])
+# Empty packet designed for mark connection endings
+EMPTY_PACKET=packetize(0, 0, 0, bytes())
