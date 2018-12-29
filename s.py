@@ -35,7 +35,7 @@ def main(argv):
   try:
     print('Connecting to {} port {}'.format(*server_address))
     sock.connect(server_address)
-    with open('reduced_input.txt','rb') as file:
+    with open('text_input.txt','rb') as file:
       upload_start_time = 0
       upload_finish_time = 0
       # next_seq_num = 0
@@ -54,9 +54,9 @@ def main(argv):
           upload_start_time = time()
         raw_packets_sent+=1
       # Wait for a message indicating the successful upload
-      print("Sending is completed. {} raw packets sent. Waiting for a response...".format(raw_packets_sent))
-      upload_finish_time = unpack('d', sock.recv(PAYLOAD_SIZE))[0]
-      print("Upload completed in ",upload_finish_time-upload_start_time,"seconds.")
+      # print("Sending is completed. {} raw packets sent. Waiting for a response...".format(raw_packets_sent))
+      # upload_finish_time = unpack('d', sock.recv(PAYLOAD_SIZE))[0]
+      # print("Upload completed in ",upload_finish_time-upload_start_time,"seconds.")
   finally:
     sock.close()
     print("Socket is closed.")
