@@ -20,7 +20,6 @@ R2_PORT=5010
 # Shared sequence and ack numbers
 packet_buffer = OrderedDict()
 shared_buffer_lock = Lock()
-seq_num=0
 ack_num=0
 largest_ack_obtained=0
 shared_number_lock = Lock()
@@ -54,12 +53,11 @@ def parseTime(payload):
 
 
 def router_handler(listen_addr, send_addr, stop, completed, queue):
-  global seq_num, ack_num
+  global ack_num
   print('[{}]: Listening to port:{}/{}'.format(current_thread().name, *listen_addr))
   sock=socket(AF_INET, SOCK_DGRAM)
   sock.bind(listen_addr)
   sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)# TODO: remove later
-  # seq_num = 0
   # ack_num = 0
   packets_sent = 0
   all_packets_sent = 0
@@ -73,39 +71,27 @@ def router_handler(listen_addr, send_addr, stop, completed, queue):
         # STATE 1: Send all packets in the window
         while(packets_sent<WINDOW_SIZE and sending):
           # Get payload (block if there is no payload to packetize)
-          payload = queue.get()
+          expected_ack_num, packet = queue.get()
           # If the payload is given as none then the connection is over
-          if(payload==None):
+          if(packet==None):
             sending=False
             print("[{}]: No new packet".format(current_thread().name))
             print("Packets to be acked:",len(packet_buffer.keys()))
             # Wait for timeouts to send packets that are pending
             break
           # EVENT 1: Send all packets in the window
-          # Get how many bytes read from file
-          payload_size = len(payload)
-          # Use this lock to grab a seq_num & ack_num pair
-          with shared_number_lock:
-            if isBase:
-              base=seq_num
-            print("[{}]: Event 1: Packet with sequence number: {} will be send to {}/{}"
-                  .format(current_thread().name, seq_num, *send_addr)) 
-            # Create packet
-            packet = packetize(seq_num, ack_num, payload_size, payload)
-            # Find next sequence number
-            seq_num = (seq_num + payload_size) % MAX_ALLOWED_SEQ_NUM
-            # Keep the expected ack number(same thing as next seq_num) along with the packet just sent 
-            packet_buffer[seq_num]=packet
-            packets_sent+=1
-            all_packets_sent+=1
-            print("[{}]: Packets sent: {}".format(current_thread().name, all_packets_sent))
-            # Send packet
-            sock.sendto(packet, send_addr)
-            # For base start the timer
-            if isBase:
-              sock.settimeout(0.1) # in seconds
-              expected_base_ack=seq_num
-              isBase=False
+          # print("[{}]: Event 1: Packet with sequence number: {} will be send to {}/{}"
+                # .format(current_thread().name, seq_num, *send_addr)) 
+          packets_sent+=1
+          all_packets_sent+=1
+          print("[{}]: Packets sent: {}".format(current_thread().name, all_packets_sent))
+          # Send packet
+          sock.sendto(packet, send_addr)
+          # For base start the timer
+          if isBase:
+            sock.settimeout(0.1) # in seconds
+            expected_base_ack=expected_ack_num
+            isBase=False
         # STATE 2: Polling for for response(s)
         # Get responses
         # print("Polling...")
@@ -133,9 +119,6 @@ def router_handler(listen_addr, send_addr, stop, completed, queue):
               recent_packet=r_payload
         setReceivedACK(largest_ack)       
         setTime(parseTime(recent_packet))
-        # # Correctly in order received, send a response
-        # if(ack_num==r_seq_num):
-        #   ack_num=(r_seq_num + r_payload_len) % MAX_ALLOWED_SEQ_NUM
         # Expecting cumulative acks
         # If ack is received including the base, disable timeout
         with shared_largest_ack_lock:
@@ -244,14 +227,17 @@ def main(argv):
           connection_socket, client_address = socketTCP.accept()
           start_time=time()
           print('[MAIN THREAD]: Connection from ip:{} on port number:{}'.format(*client_address))
+          seq_num=0
           packets_forwarded=0
           connected=True
           while connected:
             #Receive the packet
             payload, address = connection_socket.recvfrom(PAYLOAD_SIZE)
-            if(len(payload)!=PAYLOAD_SIZE):
-                queues[0].put_nowait(None)
-                queues[1].put_nowait(None)
+            # Get how many bytes read from file
+            payload_size = len(payload)
+            if(payload_size!=PAYLOAD_SIZE):
+                queues[0].put_nowait((None, None))
+                queues[1].put_nowait((None, None))
                 print("[MAIN THREAD]: {} packets forwarded. Waiting for both threads to complete...".format(packets_forwarded))
                 threads_completed.wait()
                 threads_completed.reset()
@@ -266,10 +252,16 @@ def main(argv):
                 largest_ack_obtained=0
                 connected=False
             else:
-              # Send packet via one of the threads
-              selection=packets_forwarded%2 # TODO: Use randint later 
-              queues[selection].put_nowait(payload)
-              packets_forwarded+=1
+                # Create packet
+                packet = packetize(seq_num, ack_num, payload_size, payload)
+                # Keep the expected ack number(same thing as next seq_num) along with the packet just sent 
+                packet_buffer[seq_num]=packet
+                # Find next sequence number
+                expected_ack = seq_num = (seq_num + payload_size) % MAX_ALLOWED_SEQ_NUM
+                # Send packet via one of the threads
+                selection=packets_forwarded%2 # TODO: Use randint later 
+                queues[selection].put_nowait((expected_ack, packet))
+                packets_forwarded+=1
         finally:
           connection_socket.close()
           print("[MAIN THREAD]: Connection socket is closed.")
