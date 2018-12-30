@@ -18,16 +18,23 @@ R2_IP='10.10.4.2'
 R2_PORT=5010
 
 # Shared sequence and ack numbers
-packet_buffer = OrderedDict()
-shared_buffer_lock = Lock()
-ack_num=0
-largest_ack_obtained=0
-shared_number_lock = Lock()
-shared_largest_ack_lock=Lock()
+# packet_buffer = OrderedDict()
+# shared_buffer_lock = Lock()
+# ack_num=0
+# largest_ack_obtained=0
+# shared_number_lock = Lock()
+# shared_largest_ack_lock=Lock()
 # Start and end time of upload
 start_time = 0
 end_time = 0
 shared_time_lock = Lock()
+
+# def printState():
+#   keys=list(packet_buffer.keys())
+#   print("[{}]: Packet buffer keys: {}, length:{}".format(current_thread().name,keys,len(keys)))
+#   print("[{}]: Largest ACK number: {}".format(current_thread().name,largest_ack_obtained))
+#   print("[{}]: Start time: {}".format(current_thread().name,start_time))
+#   print("[{}]: End time: {}".format(current_thread().name,end_time))
 
 
 def setTime(record):
@@ -37,11 +44,11 @@ def setTime(record):
       if(record>end_time):
         end_time=record
 
-def setReceivedACK(ack):
-  global largest_ack_obtained
-  with shared_largest_ack_lock:
-    if(ack>largest_ack_obtained):
-      largest_ack_obtained=ack
+# def setReceivedACK(ack):
+#   global largest_ack_obtained
+#   with shared_largest_ack_lock:
+#     if(ack>largest_ack_obtained):
+#       largest_ack_obtained=ack
 
 def parseTime(payload):
   if(payload):
@@ -59,117 +66,117 @@ def router_handler(listen_addr, send_addr, stop, completed, queue):
   sock.bind(listen_addr)
   sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)# TODO: remove later
   # ack_num = 0
-  packets_sent = 0
-  all_packets_sent = 0
-  sending=True
-  isBase=True
-  base=0
-  expected_base_ack=0
-  try:
-    while True:#not stop.is_set():
-      try:
-        # STATE 1: Send all packets in the window
-        while(packets_sent<WINDOW_SIZE and sending):
-          # Get payload (block if there is no payload to packetize)
-          expected_ack_num, packet = queue.get()
-          # If the payload is given as none then the connection is over
-          if(packet==None):
-            sending=False
-            print("[{}]: No new packet".format(current_thread().name))
-            print("Packets to be acked:",len(packet_buffer.keys()))
-            # Wait for timeouts to send packets that are pending
-            break
-          # EVENT 1: Send all packets in the window
-          # print("[{}]: Event 1: Packet with sequence number: {} will be send to {}/{}"
-                # .format(current_thread().name, seq_num, *send_addr)) 
-          packets_sent+=1
-          all_packets_sent+=1
-          print("[{}]: Packets sent: {}".format(current_thread().name, all_packets_sent))
-          # Send packet
-          sock.sendto(packet, send_addr)
-          # For base start the timer
-          if isBase:
-            sock.settimeout(0.1) # in seconds
-            expected_base_ack=expected_ack_num
-            isBase=False
-        # STATE 2: Polling for for response(s)
-        # Get responses
-        # print("Polling...")
-        responses = []
-        sock.setblocking(False)
-        while True:
-          try:
-            response=sock.recv(MAX_PACKET_SIZE)
-            responses.append(response)
-          except BlockingIOError:
-            break
-        sock.setblocking(True)
-        # print("End polling")
-        # EVENT 2: Packet recieved
-        # print("[{}]: Event 2: Response is received".format(current_thread().name))
-        # Parsing and checking for errors
-        recent_packet = None
-        largest_ack = -1
-        for response in responses:
-          parsed_response = parsePacket(response)
-          if(parsed_response is not None):
-            r_seq_num, r_ack_num, r_payload_len, r_payload=parsed_response[1:]
-            if(r_ack_num>=largest_ack):
-              largest_ack=r_ack_num
-              recent_packet=r_payload
-        setReceivedACK(largest_ack)       
-        setTime(parseTime(recent_packet))
+  packet_buffer=OrderedDict()
+  packetsSent = 0
+  allPacketsSent = 0
+  queueNotEmpty=True
+  keepSending=True
+  isFirstPacket=True
+  # base_seq=0
+  # next_window_seq=0
+  # expected_base_ack=0
+  # try:
+  while True:#not stop.is_set():
+    try:
+      # STATE 1: Send all packets in the window
+      while(keepSending and packetsSent<WINDOW_SIZE and queueNotEmpty):
+        # Get payload (block if there is no payload to packetize)
+        seq_num, expected_ack_num, packet = queue.get()
+        # next_window_seq = seq_num
+        # If the payload is given as none then the connection is over
+        if(packet==None):
+          queueNotEmpty=False
+          break
+        # For base start the timer
+        # if isFirstPacket:
+          # sock.settimeout(0.1) # in seconds
+          # base_seq=seq_num
+          # expected_base_ack=expected_ack_num
+          # isFirstPacket=False
+          # print("[{}]: No new packet".format(current_thread().name))
+          # print("Packets to be acked:",len(packet_buffer.keys()))
+          # Wait for timeouts to send packets that are pending
+        # EVENT 1: Send all packets in the window
+        # print("[{}]: Event 1: Packet with sequence number: {} will be send to {}/{}"
+              # .format(current_thread().name, seq_num, *send_addr)) 
+        packetsSent+=1
+        allPacketsSent+=1
+        # print("[{}]: Packets sent: {}".format(current_thread().name, allPacketsSent))
+        # Send packet
+        sock.sendto(packet, send_addr)
+        packet_buffer[expected_ack_num]=(seq_num, packet)
+      # STATE 2: Polling for for response(s)
+      # print("[{}]: Packets sent: {}".format(current_thread().name, allPacketsSent))
+      # sock.settimeout(0.1)
+      keepSending=False
+      if(queueNotEmpty or packet_buffer):
+        print("[{}]: Waiting for a response...".format(current_thread().name))
+        response=sock.recv(MAX_PACKET_SIZE)
+        parsed_response = parsePacket(response)
+        if(parsed_response is None):
+          continue
+        r_seq_num, r_ack_num, r_payload_len, r_payload=parsed_response[1:]
+        # setReceivedACK(r_ack_num)       
+        setTime(parseTime(r_payload))
+        # Mark packets correctly received (if any) and remove them from buffer
         # Expecting cumulative acks
         # If ack is received including the base, disable timeout
-        with shared_largest_ack_lock:
-          if(expected_base_ack<=largest_ack_obtained):
-            sock.settimeout(None)
-          else:
-            sock.settimeout(0.1) # in seconds
-        # print("Ack checking...")
-        # Mark packets correctly received (if any) and remove them from buffer
-        with shared_largest_ack_lock:
-          with shared_buffer_lock:
-            expected_acks=list(packet_buffer.keys())
-            for expected_ack in expected_acks:     
-              if(expected_ack<=largest_ack_obtained):
-                del packet_buffer[expected_ack]
-                packets_sent-=1
-                isBase=True
-              else:
-                break
-        # print("Ack checked.")
-        # If packet_buffer is empty all packets are sent, reset state
-        if(not packet_buffer):
-          print("[{}]: No buffered packet".format(current_thread().name))
-          # seq_num = 0
-          # ack_num = 0
-          packets_sent = 0
-          response=None
-          sending=True
-          expected_base_ack=0
-          isBase=True
-          while(response!=EMPTY_PACKET):
+        expected_base_ack=next(iter(packet_buffer))
+        print("[{}]: Base seq: {}, Expected ACK num: {}".format(current_thread().name, packet_buffer[expected_base_ack][0], expected_base_ack))
+        print("[{}]: Parsed ACK num: {}".format(current_thread().name, r_ack_num))
+        if(expected_base_ack==r_ack_num):
+          # sock.settimeout(None)
+          # isFirstPacket=True
+          del packet_buffer[r_ack_num]
+          packetsSent-=1
+          if(queueNotEmpty):
+            keepSending=True
+        elif(r_ack_num in packet_buffer):
+          del packet_buffer[r_ack_num]
+          packetsSent-=1
+      # If packet_buffer is empty all packets are sent, reset state
+      if(not queueNotEmpty and not packet_buffer):
+        # print("[{}]: No buffered packet".format(current_thread().name))
+        while(True):
+          try:
             sock.sendto(EMPTY_PACKET, send_addr)
+            # sock.settimeout(0.1) # in seconds
+            # print("[{}]: Waiting an empty packet".format(current_thread().name))
             response=sock.recv(HEADER_SIZE)
-          print("[{}]: Transmission completed".format(current_thread().name))
-          all_packets_sent=0
-          completed.wait()
-      # EVENT 3: Timeout
-      except timeout:
-          print("[{}]: Event 3: Timeout triggered, resending the first packet".format(current_thread().name))
-          with shared_buffer_lock:
-            if(expected_base_ack in packet_buffer):
-              packet=packet_buffer[expected_base_ack]
-              # Send packet
-              sock.sendto(packet, send_addr)
-              sock.settimeout(0.1)# in seconds
-  finally:
-    sock.close()
-    print("[{}]: Socket is closed.".format(current_thread().name))
+            if(response==EMPTY_PACKET):
+              break
+          except timeout:
+            pass
+        print("[{}]: Transmission completed".format(current_thread().name))
+        print("[{}]: Before barrier".format(current_thread().name))
+        completed.wait()
+        packetsSent = 0
+        allPacketsSent = 0
+        queueNotEmpty=True
+        keepSending=True
+        isFirstPacket=True
+        base_seq=0
+        next_window_seq=0
+        expected_base_ack=0
+        print("[{}]: After barrier".format(current_thread().name))
+    # EVENT 3: Timeout
+    except timeout:
+        expected_base_ack=next(iter(packet_buffer))
+        print("[{}]: Event 3: Timeout triggered, resending the packet due to base_ack: {}".format(current_thread().name, expected_base_ack))
+        packet=packet_buffer[expected_base_ack][1]
+        # Send packet
+        sock.sendto(packet, send_addr)
+        # sock.settimeout(0.1)# in seconds
+  #     except Exception as e:
+  #       print("[{}]: EXCEPTION1: {}".format(current_thread().name, e))
+  # except Exception as e:
+  #   print("EXCEPTION2:",e)
+  # finally:
+  #   sock.close()
+  #   print("[{}]: Socket is closed.".format(current_thread().name))
 
 def main(argv):
-    global R1_IP, R1_PORT, R2_IP, R2_PORT, seq_num, ack_num, start_time, end_time
+    global R1_IP, R1_PORT, R2_IP, R2_PORT, start_time, end_time
     # Create a TCP/IP socket
     socketTCP = socket(AF_INET, SOCK_STREAM)
     # Used for selection of routers randomly
@@ -218,6 +225,8 @@ def main(argv):
     r1_worker_thread.start()
     r2_worker_thread.start()
     connection_socket = None
+    seq_num=0
+    ack_num=0
     try:
       while True:
         try:
@@ -235,9 +244,9 @@ def main(argv):
             payload, address = connection_socket.recvfrom(PAYLOAD_SIZE)
             # Get how many bytes read from file
             payload_size = len(payload)
-            if(payload_size!=PAYLOAD_SIZE):
-                queues[0].put_nowait((None, None))
-                queues[1].put_nowait((None, None))
+            if(payload_size==0):
+                queues[0].put_nowait((None, None, None))
+                queues[1].put_nowait((None, None, None))
                 print("[MAIN THREAD]: {} packets forwarded. Waiting for both threads to complete...".format(packets_forwarded))
                 threads_completed.wait()
                 threads_completed.reset()
@@ -248,20 +257,24 @@ def main(argv):
                 start_time=0
                 end_time=0
                 seq_num=0
-                ack_num=0
-                largest_ack_obtained=0
+                # ack_num=0
+                # largest_ack_obtained=0
                 connected=False
+                # printState()
             else:
                 # Create packet
                 packet = packetize(seq_num, ack_num, payload_size, payload)
                 # Keep the expected ack number(same thing as next seq_num) along with the packet just sent 
-                packet_buffer[seq_num]=packet
+                # packet_buffer[seq_num]=packet
                 # Find next sequence number
-                expected_ack = seq_num = (seq_num + payload_size) % MAX_ALLOWED_SEQ_NUM
+                expected_ack = seq_num + payload_size
                 # Send packet via one of the threads
                 selection=packets_forwarded%2 # TODO: Use randint later 
-                queues[selection].put_nowait((expected_ack, packet))
+                queues[selection].put_nowait((seq_num, expected_ack, packet))
+                seq_num = expected_ack
                 packets_forwarded+=1
+        except Exception as e:
+          print("In MAIN:", e)
         finally:
           connection_socket.close()
           print("[MAIN THREAD]: Connection socket is closed.")

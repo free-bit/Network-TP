@@ -35,7 +35,7 @@ def main(argv):
   try:
     print('Connecting to {} port {}'.format(*server_address))
     sock.connect(server_address)
-    with open('text_input.txt','rb') as file:
+    with open('input.txt','rb') as file:
       upload_start_time = 0
       upload_finish_time = 0
       # next_seq_num = 0
