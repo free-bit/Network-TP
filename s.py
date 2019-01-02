@@ -1,16 +1,14 @@
 from sys import argv
-from time import *
 from socket import *
-from struct import pack, unpack
 from re import compile, match
-from packet import *
-from ntp import *
 
 # Define constants
 LOCALHOST='127.0.0.1'
 SERV_IP='10.10.1.2'
 SERV_PORT=10000
 IP_REG_EX=compile('\b(?:\d{1,3}\.){3}\d{1,3}\b')
+PAYLOAD_SIZE=976
+
 
 def main(argv):
   global SERV_IP, SERV_PORT
@@ -44,19 +42,17 @@ def main(argv):
       while(1):
         # Read from file
         payload = bytearray(file.read(PAYLOAD_SIZE))
+        payload_size = len(payload)
         # If reading is completed terminate
         if(not payload):
           break
+        # Send 3 byte payload size information
+        sock.sendall(payload_size.to_bytes(3, byteorder='little'))
         # Send packet
         sock.sendall(payload)
-        # Save the time when upload starts
-        if raw_packets_sent==0:
-          upload_start_time = time()
         raw_packets_sent+=1
-      # Wait for a message indicating the successful upload
-      # print("Sending is completed. {} raw packets sent. Waiting for a response...".format(raw_packets_sent))
-      # upload_finish_time = unpack('d', sock.recv(PAYLOAD_SIZE))[0]
-      # print("Upload completed in ",upload_finish_time-upload_start_time,"seconds.")
+        print("Payload size:", payload_size)
+      print("Sending payloads completed. {} payloads sent.".format(raw_packets_sent))
   finally:
     sock.close()
     print("Socket is closed.")

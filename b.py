@@ -9,13 +9,15 @@ from queue import *
 from packet import *
 
 # TODO: b prepares packets and sequence numbers which ease the tasks by threads
-
+# TODO: apply sudo sysctl -w net.core.rmem_max=26214400
+#             sudo sysctl -w net.core.rmem_default=26214400
 # Define constants
 LOCALHOST='127.0.0.1'
-R1_IP='10.10.2.2'
-R1_PORT=5010
-R2_IP='10.10.4.2'
-R2_PORT=5010
+D_TH1_IP='10.10.3.2'
+D_TH1_PORT=5000
+D_TH2_IP='10.10.5.2'
+D_TH2_PORT=5001
+SOURCE_SMALL_PACKET_SIZE=3
 
 # Shared sequence and ack numbers
 # packet_buffer = OrderedDict()
@@ -176,20 +178,25 @@ def router_handler(listen_addr, send_addr, stop, completed, queue):
   #   print("[{}]: Socket is closed.".format(current_thread().name))
 
 def main(argv):
-    global R1_IP, R1_PORT, R2_IP, R2_PORT, start_time, end_time
+    global D_TH1_IP, D_TH1_PORT, D_TH2_IP, D_TH2_PORT, start_time, end_time
     # Create a TCP/IP socket
     socketTCP = socket(AF_INET, SOCK_STREAM)
     # Used for selection of routers randomly
     # seed(None)
     # Define IP & port number of the server
-    IP=''
+    B_MAIN_IP='10.10.1.2'
+    B_TH1_IP='10.10.2.1'
+    B_TH2_IP='10.10.4.1'
     if(len(argv)>0):
       R_IP=argv[0]
       if(R_IP.lower()=="localhost"):
-        R1_IP=LOCALHOST
-        R2_IP=LOCALHOST
-        R1_PORT=5000
-        R2_PORT=5001
+        B_MAIN_IP=LOCALHOST
+        B_TH1_IP=LOCALHOST
+        B_TH2_IP=LOCALHOST
+        D_TH1_IP=LOCALHOST
+        D_TH2_IP=LOCALHOST
+        D_TH1_PORT=5000
+        D_TH2_PORT=5001
     # Communicate with source
     TCP_source_PORT = 10000
     # Communicate with router-1
@@ -197,17 +204,17 @@ def main(argv):
     # Communicate with router-2
     UDP_router_PORT2 = 10002 
     # Address of B that s will use
-    TCP_addr = (IP, TCP_source_PORT)
+    TCP_addr = (B_MAIN_IP, TCP_source_PORT)
     # Addresses of B that router-1 & router-2 will use
-    thread_addrs = [(IP, UDP_router_PORT1), (IP, UDP_router_PORT2)]
+    b_th_addrs = [(B_TH1_IP, UDP_router_PORT1), (B_TH2_IP, UDP_router_PORT2)]
     # Addresses for link-1 (r1), link-3 (r2)
-    router_addrs = [(R1_IP, R1_PORT), (R2_IP, R2_PORT)]
+    d_th_addrs = [(D_TH1_IP, D_TH1_PORT), (D_TH2_IP, D_TH2_PORT)]
     print('[MAIN THREAD]: Starting TCP server on {} port {}'.format(*TCP_addr))
     # Bind the sockets to the ports
     i=0
     while True:
       try:
-        socketTCP.bind((IP, TCP_source_PORT+i))
+        socketTCP.bind((B_MAIN_IP, TCP_source_PORT+i))
         print("WARNING: Opened port:", TCP_source_PORT+i)
         break
       except OSError:
@@ -220,10 +227,10 @@ def main(argv):
     q2=Queue(3000)
     queues=[q1, q2]
     threads_completed=Barrier(3)
-    r1_worker_thread=Thread(target=router_handler, args=(thread_addrs[0], router_addrs[0], stop_threads, threads_completed, q1))
-    r2_worker_thread=Thread(target=router_handler, args=(thread_addrs[1], router_addrs[1], stop_threads, threads_completed, q2))
-    r1_worker_thread.start()
-    r2_worker_thread.start()
+    r1_worker_thread=Thread(target=router_handler, args=(b_th_addrs[0], d_th_addrs[0], stop_threads, threads_completed, q1)) # TODO: Uncomment
+    r2_worker_thread=Thread(target=router_handler, args=(b_th_addrs[1], d_th_addrs[1], stop_threads, threads_completed, q2)) # TODO: Uncomment
+    r1_worker_thread.start() # TODO: Uncomment
+    r2_worker_thread.start() # TODO: Uncomment
     connection_socket = None
     seq_num=0
     ack_num=0
@@ -238,41 +245,59 @@ def main(argv):
           print('[MAIN THREAD]: Connection from ip:{} on port number:{}'.format(*client_address))
           seq_num=0
           packets_forwarded=0
-          connected=True
-          while connected:
-            #Receive the packet
-            payload, address = connection_socket.recvfrom(PAYLOAD_SIZE)
-            # Get how many bytes read from file
-            payload_size = len(payload)
-            if(payload_size==0):
+          # bytes_received_in_total=0
+          while True:
+            #Receive the message boundary for the packet first
+            initialBytesToRead = SOURCE_SMALL_PACKET_SIZE
+            bytesToRead = bytes()
+            while(initialBytesToRead):
+              read = connection_socket.recv(initialBytesToRead)
+              if(len(read)==0):
+                break
+              initialBytesToRead -= len(read)
+              bytesToRead += read
+            # print("Size of reading:",len(bytesToRead))
+            # print("Value of reading:", bytesToRead)
+            if(len(bytesToRead)==0):
                 queues[0].put_nowait((None, None, None))
                 queues[1].put_nowait((None, None, None))
                 print("[MAIN THREAD]: {} packets forwarded. Waiting for both threads to complete...".format(packets_forwarded))
+                # print("[MAIN THREAD]: Total number of bytes received from the source:",bytes_received_in_total) 
                 threads_completed.wait()
                 threads_completed.reset()
                 print("[MAIN THREAD]: Start time of upload:", start_time)
                 print("[MAIN THREAD]: End time of upload:", end_time)
                 print("[MAIN THREAD]: Duration of upload:", end_time-start_time)
                 connection_socket.sendall(pack('d', end_time))
+                #TODO: remove later
                 start_time=0
                 end_time=0
                 seq_num=0
+                break
                 # ack_num=0
                 # largest_ack_obtained=0
-                connected=False
+                # connected=False
                 # printState()
-            else:
-                # Create packet
-                packet = packetize(seq_num, ack_num, payload_size, payload)
-                # Keep the expected ack number(same thing as next seq_num) along with the packet just sent 
-                # packet_buffer[seq_num]=packet
-                # Find next sequence number
-                expected_ack = seq_num + payload_size
-                # Send packet via one of the threads
-                selection=packets_forwarded%2 # TODO: Use randint later 
-                queues[selection].put_nowait((seq_num, expected_ack, packet))
-                seq_num = expected_ack
-                packets_forwarded+=1
+            payload_size = bytesToRead = int.from_bytes(bytesToRead, byteorder='little')
+            payload = bytes()
+            while(bytesToRead):
+              read = connection_socket.recv(bytesToRead)
+              bytesToRead -= len(read)
+              payload += read
+            # Get how many bytes read from file
+            # print("Payload size:", payload_size)
+            # bytes_received_in_total+=payload_size
+            # Create packet
+            packet = packetize(seq_num, ack_num, payload_size, payload)
+            # Keep the expected ack number(same thing as next seq_num) along with the packet just sent 
+            # packet_buffer[seq_num]=packet
+            # Find next sequence number
+            expected_ack = seq_num + payload_size
+            # Send packet via one of the threads
+            selection=packets_forwarded%2 # TODO: Use randint later 
+            queues[selection].put_nowait((seq_num, expected_ack, packet))
+            seq_num = expected_ack
+            packets_forwarded+=1
         except Exception as e:
           print("In MAIN:", e)
         finally:
@@ -283,8 +308,8 @@ def main(argv):
           connection_socket.close()
         # Close the socket
         socketTCP.close()
-        r1_worker_thread.join()
-        r2_worker_thread.join()
+        r1_worker_thread.join() # TODO: Uncomment
+        r2_worker_thread.join() # TODO: Uncomment
         print("[MAIN THREAD]: Socket is closed.")
 if __name__ == "__main__":
     main(argv[1:])

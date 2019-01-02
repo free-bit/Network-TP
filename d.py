@@ -157,11 +157,16 @@ def router_handler(addr, completed):
 
 def main(argv):
   # Define IP & port number of the server
-  IP = ''
-  UDP_R1_PORT = 5000 # Communicate with r1
-  UDP_R2_PORT = 5001 # Communicate with r2
-  UDP_addr1 = (IP, UDP_R1_PORT) # Address of d (main thread) that r1 will use
-  UDP_addr2 = (IP, UDP_R2_PORT) # Address of d (worker thread) that r2 will use
+  TH1_IP = '10.10.3.2'
+  TH2_IP = '10.10.5.2'
+  argc=len(argv)
+  if(argc>0):
+    TH1_IP=''
+    TH2_IP=''
+  UDP_TH1_PORT = 5000 # Communicate with r1
+  UDP_TH2_PORT = 5001 # Communicate with r2
+  UDP_addr1 = (TH1_IP, UDP_TH1_PORT) # Address of d (main thread) that r1 will use
+  UDP_addr2 = (TH2_IP, UDP_TH2_PORT) # Address of d (worker thread) that r2 will use
   # Initialize and start threads
   completed=Barrier(3)
   th1=Thread(target=router_handler, args=(UDP_addr1, completed))
