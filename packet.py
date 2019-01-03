@@ -1,7 +1,6 @@
 from sys import argv
 from hashlib import md5
-# Define max number pipelining
-WINDOW_SIZE=1024
+
 # Define max allowed field sizes in bytes for each field
 MAX_PACKET_SIZE = 1000
 CHKSUM_FIELD = 16

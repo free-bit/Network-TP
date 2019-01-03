@@ -18,7 +18,8 @@ D_TH1_PORT=5000
 D_TH2_IP='10.10.5.2'
 D_TH2_PORT=5001
 SOURCE_SMALL_PACKET_SIZE=3
-
+# Define max number of pipelining
+WINDOW_SIZE=30
 # Shared sequence and ack numbers
 # packet_buffer = OrderedDict()
 # shared_buffer_lock = Lock()
