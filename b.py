@@ -24,15 +24,18 @@ WINDOW_SIZE=30
 start_time = 0
 end_time = 0
 shared_time_lock = Lock()
-# Timer handler is called in every 10 ms
+# Timer handler is called in every TIMER_PERIOD seconds
 TIMER_PERIOD = 0.01
-# Timeout takes place every 5th enterance to the handler
-TIMEOUT_PERIOD = 5
+# Timeout takes place every "TIMEOUT_PERIOD"th enterance to the handler 
+TIMEOUT_PERIOD = 3
+# (TIMER_PERIOD*TIMEOUT_PERIOD seconds is the timeout value)
 interrupt_count=0
-timerLock = Lock()
+th1_timerLock = Lock()
+th2_timerLock = Lock()
 
 # Only the main thread enters the handler
 def timerHandler(signum, _):
+  global th1_timerLock, th2_timerLock
   # global interrupt_count
   # Update thread-1 timer context, take action if time is out
   threads[0].tickAll()
@@ -56,13 +59,14 @@ def setTime(record):
         end_time=record
 
 class BrokerThread(Thread):
-  def __init__(self, sock, send_addr, barrier, queue):
+  def __init__(self, sock, send_addr, barrier, queue, timerLock):
     super(BrokerThread, self).__init__()
     # Provided by main
-    self.barrier=barrier
-    self.shared_queue=queue
     self.sock = sock
     self.send_addr = send_addr
+    self.barrier=barrier
+    self.shared_queue=queue
+    self.timerLock = timerLock
     # Thread local context which has to be reset at every new connection
     # Possible expected ack values: 
       # None: No ACK is expected
@@ -93,36 +97,50 @@ class BrokerThread(Thread):
   def getBoundAddress(self):
     return self.sock.getsockname()
 
-  # Set/start timeout for the packet with provided index
+  # Set/start timeout for the packet with provided index (SHARED with main thread)
   def startTimer(self, index=None):
-    if(not index):
-      index=self.windowNext
-    self.timers[index]=TIMEOUT_PERIOD
+    with self.timerLock:
+      # print("[{}]: startTimer-Lock held".format(self.getName()))
+      if(not index):
+        index=self.windowNext
+      self.timers[index]=TIMEOUT_PERIOD
+    # print("[{}]: startTimer-released".format(self.getName()))
 
-  # Disable timeout for the packet with provided index
+  # Disable timeout for the packet with provided index (Not shared but timer value changes)
   def stopTimer(self, index):
-    self.timers[index]=None
+    with self.timerLock:
+      # print("[{}]: stopTimer-Lock held".format(self.getName()))
+      self.timers[index]=None
+    # print("[{}]: stopTimer-Lock released".format(self.getName()))
 
-  # Try to update the timer, if it is not set do nothing
+  # Try to update the timer, if it is not set do nothing (Called only by main thread)
   def tick(self, index):
-    try:
-      self.timers[index]-=1
-    except TypeError:
-      pass
+    with self.timerLock:
+      # print("[{}]: tick-Lock held".format(self.getName()))
+      try:
+        self.timers[index]-=1
+      except TypeError:
+        pass
+    # print("[{}]: tick-Lock released".format(self.getName()))
 
-  # Send packet in the window, used for resending the packet
+  # Send packet in the window, used for resending the packet (Called only by main thread)
   def sendPacketFromWindow(self, index):
     print("[{}]: Retransmission of packet with expected ACK: {}".format(self.getName(), self.expected_acks[index]))
     self.sendPacket(self.packets[index])
-    self.timers[index]=TIMEOUT_PERIOD
+    self.startTimer(index)
 
-  # Send the packet
+  # Send the packet (SHARED with main thread)
   def sendPacket(self, packet, send_addr=None):
-    if(not send_addr):
-      send_addr=self.send_addr
-    self.sock.sendto(packet, send_addr)
+    with self.timerLock:
+      # print("[{}]: sendPacket-Lock held".format(self.getName()))
+      if(not send_addr):
+        send_addr=self.send_addr
+      # Handle the case where the retransmitted packet is removed just before the timeout
+      if(packet):
+        self.sock.sendto(packet, send_addr)
+    # print("[{}]: sendPacket-Lock released".format(self.getName()))
 
-  # When one TIMER_PERIOD is passed, update all active timers and resend timed-out packets
+  # When one TIMER_PERIOD is passed, update all active timers and resend timed-out packets (Called only by main thread)
   def tickAll(self):
     global WINDOW_SIZE
     for i in range(WINDOW_SIZE):
@@ -141,7 +159,7 @@ class BrokerThread(Thread):
     else:
       raise Exception("Enqueue to a full queue!")
 
-  # Dequeue
+  # Dequeue and stop timer
   def dequeue(self):
     if(not self.isWindowEmpty()):
       self.expected_acks[self.windowBase]=None
@@ -249,6 +267,8 @@ class BrokerThread(Thread):
           # print("[{}]: No buffered packet".format(current_thread().name))
           while(True):
             self.sendPacket(EMPTY_PACKET)
+            self.enqueue(0, EMPTY_PACKET)
+            self.startTimer()
             # print("[{}]: Waiting an empty packet".format(current_thread().name))
             isEmpty = self.getEmptyPacket()
             if(isEmpty):
@@ -263,44 +283,9 @@ class BrokerThread(Thread):
 
 threads=[]
 
-# def placePacket(thread_id, expected_ack_num, packet):
-#   if thread_id!=1 or thread_id!=2:
-#     print("Error in packet insertion")
-#     return
-#   threads[thread_id].enqueue(expected_ack_num, packet)
-
-# def slideWindow(thread_id):
-#   threads[thread_id].slideWindow()
-
-# def printState():
-#   keys=list(packet_buffer.keys())
-#   print("[{}]: Packet buffer keys: {}, length:{}".format(current_thread().name,keys,len(keys)))
-#   print("[{}]: Largest ACK number: {}".format(current_thread().name,largest_ack_obtained))
-#   print("[{}]: Start time: {}".format(current_thread().name,start_time))
-#   print("[{}]: End time: {}".format(current_thread().name,end_time))
-
-# def setReceivedACK(ack):
-#   global largest_ack_obtained
-#   with shared_largest_ack_lock:
-#     if(ack>largest_ack_obtained):
-#       largest_ack_obtained=ack
-
-
-# def router_handler(context, stop, , ):
-#   global ack_num
-#   print('[{}]: Listening to port:{}/{}'.format(current_thread().name, *context.getSocket().getsockname()))
-  # sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)# TODO: remove later
-  # ack_num = 0
-  # packet_buffer=OrderedDict()
-  
-  # except Exception as e:
-  #   print("EXCEPTION2:",e)
-  # finally:
-  #   sock.close()
-  #   print("[{}]: Socket is closed.".format(current_thread().name))
-
 def main(argv):
     global threads, interrupt_count,\
+           th1_timerLock, th2_timerLock,\
            D_TH1_IP, D_TH1_PORT,\
            D_TH2_IP, D_TH2_PORT,\
            start_time, end_time
@@ -354,8 +339,8 @@ def main(argv):
     # stop_threads = Event()
     queues=[Queue(3000), Queue(3000)]
     barrier=Barrier(3)
-    r1_worker_thread=BrokerThread(sock1, d_th_addrs[0], barrier, queues[0]) # TODO: Uncomment
-    r2_worker_thread=BrokerThread(sock2, d_th_addrs[1], barrier, queues[1]) # TODO: Uncomment
+    r1_worker_thread=BrokerThread(sock1, d_th_addrs[0], barrier, queues[0], th1_timerLock) # TODO: Uncomment
+    r2_worker_thread=BrokerThread(sock2, d_th_addrs[1], barrier, queues[1], th2_timerLock) # TODO: Uncomment
     threads.append(r1_worker_thread)
     threads.append(r2_worker_thread)
     r1_worker_thread.start() # TODO: Uncomment
@@ -363,80 +348,82 @@ def main(argv):
     connection_socket = None
     seq_num=0
     ack_num=0
-    try:
-      while True:
-        try:
-          # Wait for a connection
-          print('[MAIN THREAD]: Waiting for a connection...')
-          # New TCP socket is opened and named as "connection_socket"
-          connection_socket, client_address = socketTCP.accept()
-          start_time=time()
-          print('[MAIN THREAD]: Connection from ip:{} on port number:{}'.format(*client_address))
-          # Decrement interval timer in real time, and deliver SIGALRM upon expiration.
-          # Start timer after 50 ms
-          # Call handler in every TIMER_PERIOD seconds
-          setitimer(ITIMER_REAL, 0.05, TIMER_PERIOD)
-          seq_num=0
-          packets_forwarded=0
-          # bytes_received_in_total=0
-          while True:
-            # Receive the message size/boundary for the packet first
-            initialBytesToRead = SOURCE_SMALL_PACKET_SIZE
-            bytesToRead = bytes()
-            while(initialBytesToRead):
-              read = connection_socket.recv(initialBytesToRead)
-              if(len(read)==0):
-                break
-              initialBytesToRead -= len(read)
-              bytesToRead += read
-            # print("Size of reading:",len(bytesToRead))
-            # print("Value of reading:", bytesToRead)
-            if(len(bytesToRead)==0):
-                queues[0].put_nowait((None, None, None))
-                queues[1].put_nowait((None, None, None))
-                print("[MAIN THREAD]: {} packets forwarded. Waiting for both threads to complete...".format(packets_forwarded))
-                # print("[MAIN THREAD]: Total number of bytes received from the source:",bytes_received_in_total) 
-                barrier.wait()
-                barrier.reset()
-                setitimer(ITIMER_REAL, 0, 0)
-                # print("[MAIN THREAD]: Start time of upload:", start_time)
-                # print("[MAIN THREAD]: End time of upload:", end_time)
-                print("[MAIN THREAD]: Duration of upload:", end_time-start_time)
-                start_time=0
-                end_time=0
-                seq_num=0
-                break
-            # Reading payload with respect to size defined in the earlier message
-            payload_size = bytesToRead = int.from_bytes(bytesToRead, byteorder='little')
-            payload = bytes()
-            while(bytesToRead):
-              read = connection_socket.recv(bytesToRead)
-              bytesToRead -= len(read)
-              payload += read
-            # print("Payload size:", payload_size)
-            # bytes_received_in_total+=payload_size
-            # print("Interrupt count:", interrupt_count)
-            # Create packet
-            packet = packetize(seq_num, ack_num, payload_size, payload)
-            # Find next sequence number
-            expected_ack = seq_num + payload_size
-            # Send packet via one of the threads
-            selection=packets_forwarded%2 # TODO: Use randint later 
-            queues[selection].put_nowait((seq_num, expected_ack, packet))
-            seq_num = expected_ack
-            packets_forwarded+=1
-        except Exception as e:
-          print("In MAIN:", e)
-        finally:
-          connection_socket.close()
-          print("[MAIN THREAD]: Connection socket is closed.")
-    finally:
-        if(connection_socket):
-          connection_socket.close()
-        # Close the socket
-        socketTCP.close()
-        r1_worker_thread.join() # TODO: Uncomment
-        r2_worker_thread.join() # TODO: Uncomment
-        print("[MAIN THREAD]: Socket is closed.")
+    # try:
+    while True:
+      # try:
+        # Wait for a connection
+        print('[MAIN THREAD]: Waiting for a connection...')
+        # New TCP socket is opened and named as "connection_socket"
+        connection_socket, client_address = socketTCP.accept()
+        start_time=time()
+        print('[MAIN THREAD]: Connection from ip:{} on port number:{}'.format(*client_address))
+        # Decrement interval timer in real time, and deliver SIGALRM upon expiration.
+        # Start timer after 50 ms
+        # Call handler in every TIMER_PERIOD seconds
+        setitimer(ITIMER_REAL, 0.05, TIMER_PERIOD)
+        seq_num=0
+        packets_forwarded=0
+        # bytes_received_in_total=0
+        while True:
+          # Receive the message size/boundary for the packet first
+          initialBytesToRead = SOURCE_SMALL_PACKET_SIZE
+          bytesToRead = bytes()
+          while(initialBytesToRead):
+            read = connection_socket.recv(initialBytesToRead)
+            if(len(read)==0):
+              break
+            initialBytesToRead -= len(read)
+            bytesToRead += read
+          # print("Size of reading:",len(bytesToRead))
+          # print("Value of reading:", bytesToRead)
+          if(len(bytesToRead)==0):
+              queues[0].put_nowait((None, None, None))
+              queues[1].put_nowait((None, None, None))
+              print("[MAIN THREAD]: {} packets forwarded. Waiting for both threads to complete...".format(packets_forwarded))
+              # print("[MAIN THREAD]: Total number of bytes received from the source:",bytes_received_in_total) 
+              barrier.wait()
+              barrier.reset()
+              setitimer(ITIMER_REAL, 0, 0)
+              # print("[MAIN THREAD]: Start time of upload:", start_time)
+              # print("[MAIN THREAD]: End time of upload:", end_time)
+              print("[MAIN THREAD]: Duration of upload:", end_time-start_time)
+              start_time=0
+              end_time=0
+              seq_num=0
+              break
+          # Reading payload with respect to size defined in the earlier message
+          payload_size = bytesToRead = int.from_bytes(bytesToRead, byteorder='little')
+          payload = bytes()
+          while(bytesToRead):
+            read = connection_socket.recv(bytesToRead)
+            bytesToRead -= len(read)
+            payload += read
+          # print("Payload size:", payload_size)
+          # bytes_received_in_total+=payload_size
+          # print("Interrupt count:", interrupt_count)
+          # Create packet
+          packet = packetize(seq_num, ack_num, payload_size, payload)
+          # Find next sequence number
+          expected_ack = seq_num + payload_size
+          # Send packet via one of the threads
+          selection=packets_forwarded%2 # TODO: Use randint later 
+          queues[selection].put_nowait((seq_num, expected_ack, packet))
+          seq_num = expected_ack
+          packets_forwarded+=1
+    #     except Exception as e:
+    #       print("In MAIN:", e)
+    #     finally:
+    #       connection_socket.close()
+    #       print("[MAIN THREAD]: Connection socket is closed.")
+    # finally:
+    #     if(connection_socket):
+    #       connection_socket.close()
+    #     # Close the sockets
+    #     socketTCP.close()
+    #     r1_worker_thread.join() # TODO: Uncomment
+    #     r2_worker_thread.join() # TODO: Uncomment
+    #     sock1.close()
+    #     sock2.close()
+    #     print("[MAIN THREAD]: Sockets are closed.")
 if __name__ == "__main__":
     main(argv[1:])

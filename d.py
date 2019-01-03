@@ -102,58 +102,42 @@ def router_handler(addr, completed):
   # seq_num = 0
   ack_num = 0
   packets_received=0
-  receiving=True
-  gap_exists=True
-  # try:
-  while True:
-    packets=[]
+  try:
     while True:
-      readyToRead, readyToWrite, error = select([sock], [], [], 0)
-      if(readyToRead):
-        packet, address = readyToRead[0].recvfrom(MAX_PACKET_SIZE)
-        packets.append(packet)
-      elif(not readyToRead and packets):
-        break
-      # Connection is over
-      elif(not receiving and not readyToRead and not packets):
-        sock.sendto(EMPTY_PACKET, address)
-        print("[{}]: Empty packet is sent".format(current_thread().name))
-        # print("[{}]: Connection is over".format(current_thread().name))
-        completed.wait()
-        print("[{}]: After barrier".format(current_thread().name))
-        ack_num = 0
-        packets_received=0
-        receiving=True
-      else:
-        continue
-    for packet in packets:
+      packet, address = sock.recvfrom(MAX_PACKET_SIZE)
       # Parse
       parsed=parsePacket(packet)
       # Check if intact
       if(parsed is None):
         continue
-      # Check if EMPTY_PACKET, special case that marks the end 
+      # Check if EMPTY_PACKET, special case indicating that connection is over
       if(packet==EMPTY_PACKET):
         print("EMPTY PACKET RECEIVED")
-        receiving=False
-        continue  
+        sock.sendto(EMPTY_PACKET, address)
+        print("[{}]: Empty packet is sent".format(current_thread().name))
+        # print("[{}]: Connection is over".format(current_thread().name))
+        # This check is required for the retransmission of the empty packet
+        if(packets_received):
+          completed.wait()
+          print("[{}]: After barrier".format(current_thread().name))
+          ack_num = 0
+          packets_received=0
+        continue
       packets_received+=1
       r_seq_num, r_ack_num, r_payload_len, r_payload=parsed[1:]
       print("[{}]: Retrieved packet: {}".format(current_thread().name, r_seq_num))
       storePacketOnBuffer(r_seq_num, r_payload, r_payload_len)
-      # print("[{}]: Packets received correctly: {}".format(current_thread().name, packets_received))
-      # print("[{}]: Packets on ready buffer: {}".format(current_thread().name, len(ready_buffer)))
       print("[{}]: Packets on packet buffer: {}".format(current_thread().name, len(packet_buffer)))
       given_ack=r_seq_num+r_payload_len
       response=prepareResponse(given_ack)
       sock.sendto(response, address)
       print("[{}]: Given ACK: {}\n".format(current_thread().name, given_ack))
-        # print("[{}]: Packet with ack {} is sent".format(current_thread().name, ack_num))
-  # except Exception as e:
-  #   print("[{}]: EXCEPTION: {}".format(current_thread().name,e))
-  # finally:
-  #   sock.close()
-  #   print("[{}]: Socket is closed.".format(current_thread().name))
+      # print("[{}]: Packet with ack {} is sent".format(current_thread().name, ack_num))
+  except Exception as e:
+    print("[{}]: EXCEPTION: {}".format(current_thread().name,e))
+  finally:
+    sock.close()
+    print("[{}]: Socket is closed.".format(current_thread().name))
 
 def main(argv):
   # Define IP & port number of the server
