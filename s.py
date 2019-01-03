@@ -51,7 +51,7 @@ def main(argv):
         # Send packet
         sock.sendall(payload)
         raw_packets_sent+=1
-        print("Payload size:", payload_size)
+        # print("Payload size:", payload_size)
       print("Sending payloads completed. {} payloads sent.".format(raw_packets_sent))
   finally:
     sock.close()

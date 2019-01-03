@@ -7,10 +7,10 @@ from socket import *
 from threading import *
 from queue import *
 from packet import *
+from signal import *
 
-# TODO: b prepares packets and sequence numbers which ease the tasks by threads
-# TODO: apply sudo sysctl -w net.core.rmem_max=26214400
-#             sudo sysctl -w net.core.rmem_default=26214400
+# TODO: create a proper indexing mechanism for packets sent
+
 # Define constants
 LOCALHOST='127.0.0.1'
 D_TH1_IP='10.10.3.2'
@@ -20,38 +20,25 @@ D_TH2_PORT=5001
 SOURCE_SMALL_PACKET_SIZE=3
 # Define max number of pipelining
 WINDOW_SIZE=30
-# Shared sequence and ack numbers
-# packet_buffer = OrderedDict()
-# shared_buffer_lock = Lock()
-# ack_num=0
-# largest_ack_obtained=0
-# shared_number_lock = Lock()
-# shared_largest_ack_lock=Lock()
 # Start and end time of upload
 start_time = 0
 end_time = 0
 shared_time_lock = Lock()
+# Timer handler is called in every 10 ms
+TIMER_PERIOD = 0.01
+# Timeout takes place every 5th enterance to the handler
+TIMEOUT_PERIOD = 5
+interrupt_count=0
+timerLock = Lock()
 
-# def printState():
-#   keys=list(packet_buffer.keys())
-#   print("[{}]: Packet buffer keys: {}, length:{}".format(current_thread().name,keys,len(keys)))
-#   print("[{}]: Largest ACK number: {}".format(current_thread().name,largest_ack_obtained))
-#   print("[{}]: Start time: {}".format(current_thread().name,start_time))
-#   print("[{}]: End time: {}".format(current_thread().name,end_time))
-
-
-def setTime(record):
-  global end_time
-  if(record):
-    with shared_time_lock:
-      if(record>end_time):
-        end_time=record
-
-# def setReceivedACK(ack):
-#   global largest_ack_obtained
-#   with shared_largest_ack_lock:
-#     if(ack>largest_ack_obtained):
-#       largest_ack_obtained=ack
+# Only the main thread enters the handler
+def timerHandler(signum, _):
+  # global interrupt_count
+  # Update thread-1 timer context, take action if time is out
+  threads[0].tickAll()
+  # Update thread-2 timer context, take action if time is out
+  threads[1].tickAll()
+  # interrupt_count+=1
 
 def parseTime(payload):
   if(payload):
@@ -61,117 +48,251 @@ def parseTime(payload):
     return epoch
   return None
 
+def setTime(record):
+  global end_time
+  if(record):
+    with shared_time_lock:
+      if(record>end_time):
+        end_time=record
 
-def router_handler(listen_addr, send_addr, stop, completed, queue):
-  global ack_num
-  print('[{}]: Listening to port:{}/{}'.format(current_thread().name, *listen_addr))
-  sock=socket(AF_INET, SOCK_DGRAM)
-  sock.bind(listen_addr)
-  sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)# TODO: remove later
-  # ack_num = 0
-  packet_buffer=OrderedDict()
-  packetsSent = 0
-  allPacketsSent = 0
-  queueNotEmpty=True
-  keepSending=True
-  isFirstPacket=True
-  # base_seq=0
-  # next_window_seq=0
-  # expected_base_ack=0
-  # try:
-  while True:#not stop.is_set():
+class BrokerThread(Thread):
+  def __init__(self, sock, send_addr, barrier, queue):
+    super(BrokerThread, self).__init__()
+    # Provided by main
+    self.barrier=barrier
+    self.shared_queue=queue
+    self.sock = sock
+    self.send_addr = send_addr
+    # Thread local context which has to be reset at every new connection
+    # Possible expected ack values: 
+      # None: No ACK is expected
+      # True: ACK is already received,
+      # Float: Specified ACK is expected
+    self.expected_acks=[None]*WINDOW_SIZE
+    self.packets = [None]*WINDOW_SIZE
+    self.timers = [None]*WINDOW_SIZE
+    self.windowBase = 0
+    self.windowNext = WINDOW_SIZE-1
+    self.isFull=False
+
+  def isWindowFull(self):
+    return self.isFull 
+
+  def isWindowEmpty(self):
+    return (not self.isFull) and ((self.windowNext+1) % WINDOW_SIZE == self.windowBase)
+
+  def setSocket(self, sock):
+    self.sock=sock
+
+  def setSendAddr(self, addr):
+    self.send_addr=addr
+
+  def getSocket(self):
+    return self.sock
+
+  def getBoundAddress(self):
+    return self.sock.getsockname()
+
+  # Set/start timeout for the packet with provided index
+  def startTimer(self, index=None):
+    if(not index):
+      index=self.windowNext
+    self.timers[index]=TIMEOUT_PERIOD
+
+  # Disable timeout for the packet with provided index
+  def stopTimer(self, index):
+    self.timers[index]=None
+
+  # Try to update the timer, if it is not set do nothing
+  def tick(self, index):
     try:
-      # STATE 1: Send all packets in the window
-      while(keepSending and packetsSent<WINDOW_SIZE and queueNotEmpty):
-        # Get payload (block if there is no payload to packetize)
-        seq_num, expected_ack_num, packet = queue.get()
-        # next_window_seq = seq_num
-        # If the payload is given as none then the connection is over
-        if(packet==None):
-          queueNotEmpty=False
-          break
-        # For base start the timer
-        # if isFirstPacket:
-          # sock.settimeout(0.1) # in seconds
-          # base_seq=seq_num
-          # expected_base_ack=expected_ack_num
-          # isFirstPacket=False
-          # print("[{}]: No new packet".format(current_thread().name))
-          # print("Packets to be acked:",len(packet_buffer.keys()))
-          # Wait for timeouts to send packets that are pending
-        # EVENT 1: Send all packets in the window
-        # print("[{}]: Event 1: Packet with sequence number: {} will be send to {}/{}"
-              # .format(current_thread().name, seq_num, *send_addr)) 
-        packetsSent+=1
-        allPacketsSent+=1
+      self.timers[index]-=1
+    except TypeError:
+      pass
+
+  # Send packet in the window, used for resending the packet
+  def sendPacketFromWindow(self, index):
+    print("[{}]: Retransmission of packet with expected ACK: {}".format(self.getName(), self.expected_acks[index]))
+    self.sendPacket(self.packets[index])
+    self.timers[index]=TIMEOUT_PERIOD
+
+  # Send the packet
+  def sendPacket(self, packet, send_addr=None):
+    if(not send_addr):
+      send_addr=self.send_addr
+    self.sock.sendto(packet, send_addr)
+
+  # When one TIMER_PERIOD is passed, update all active timers and resend timed-out packets
+  def tickAll(self):
+    global WINDOW_SIZE
+    for i in range(WINDOW_SIZE):
+      self.tick(i)
+      if(self.timers[i]==0):
+        self.sendPacketFromWindow(i)
+
+  # Enqueue
+  def enqueue(self, expected_ack, packet):
+    if(not self.isWindowFull()):
+      self.windowNext=(self.windowNext+1) % WINDOW_SIZE
+      self.expected_acks[self.windowNext]=expected_ack
+      self.packets[self.windowNext]=packet
+      if(self.windowNext+1) % WINDOW_SIZE == self.windowBase: 
+        self.isFull = True
+    else:
+      raise Exception("Enqueue to a full queue!")
+
+  # Dequeue
+  def dequeue(self):
+    if(not self.isWindowEmpty()):
+      self.expected_acks[self.windowBase]=None
+      self.packets[self.windowBase]=None
+      self.stopTimer(self.windowBase) 
+      self.windowBase = (self.windowBase+1) % WINDOW_SIZE
+      self.isFull = False
+    else:
+      raise Exception("Dequeue from an empty queue!")
+
+  # Receive a packet from the server, parse, if no error return parsed
+  def getResponse(self, size=MAX_PACKET_SIZE):
+    response=self.sock.recv(size)
+    # Parsing operation performs checksum validation
+    parsed_response = parsePacket(response)
+    if(parsed_response is None):
+      return None
+    # Return values other than checksum
+    return parsed_response[1:]
+
+  # Receive the empty packet from the server, if incoming packet corrupted, discard
+  def getEmptyPacket(self, size=HEADER_SIZE):
+    response=self.sock.recv(size)
+    if(response==EMPTY_PACKET):
+      return True
+    return False
+
+  # Find new base i.e. first unACKed packet
+  def getFirstUnACKed(self):
+    global WINDOW_SIZE
+    count=0
+    new_base=self.windowBase
+    while self.expected_acks[new_base]==True:
+      new_base=(new_base+1)%WINDOW_SIZE
+      count+=1
+    return count
+  # Slide the window and update the base
+  # When sliding all packets before the first unACKed packet will be removed
+  def slideWindow(self):
+    number_of_slides=self.getFirstUnACKed()
+    while number_of_slides:
+      self.dequeue()
+      number_of_slides-=1
+
+  # Mark packet with given ACK
+  # If ack is for the base, then slide the window
+  def getACK(self, ack):
+    try:
+      index=self.expected_acks.index(ack)
+    except ValueError:
+      return
+    self.stopTimer(index)
+    self.expected_acks[index]=True
+    if(index==self.windowBase):
+      self.slideWindow()
+
+  # Reset state to initial configuration
+  def reset(self):
+    self.expected_acks=[None]*WINDOW_SIZE
+    self.packets = [None]*WINDOW_SIZE
+    self.timers = [None]*WINDOW_SIZE
+    self.windowBase = 0
+    self.windowNext = WINDOW_SIZE-1
+    self.isFull = False
+
+  # Thread loop
+  def run(self):
+    global ack_num
+    print('[{}]: Listening to port:{}/{}'.format(self.getName(), *self.getBoundAddress()))
+    allPacketsSent = 0
+    # Flag for shared_queue
+    packetsToSend=True
+    # try:
+    while True:
+      # try:
+        # STATE 1: Send all packets in the window
+        while(not self.isWindowFull() and packetsToSend):
+          # Get payload (block if there is no payload to packetize)
+          seq_num, expected_ack_num, packet = self.shared_queue.get()
+          # If the payload is given as none then the connection is over
+          if(packet==None):
+            packetsToSend=False
+            break
+          # Send packet to destination, store in buffer and start the timer
+          self.sendPacket(packet)
+          self.enqueue(expected_ack_num, packet)
+          self.startTimer()
+          allPacketsSent+=1
+        # STATE 2: Polling for for response(s)
         # print("[{}]: Packets sent: {}".format(current_thread().name, allPacketsSent))
-        # Send packet
-        sock.sendto(packet, send_addr)
-        packet_buffer[expected_ack_num]=(seq_num, packet)
-      # STATE 2: Polling for for response(s)
-      # print("[{}]: Packets sent: {}".format(current_thread().name, allPacketsSent))
-      # sock.settimeout(0.1)
-      keepSending=False
-      if(queueNotEmpty or packet_buffer):
-        print("[{}]: Waiting for a response...".format(current_thread().name))
-        response=sock.recv(MAX_PACKET_SIZE)
-        parsed_response = parsePacket(response)
-        if(parsed_response is None):
-          continue
-        r_seq_num, r_ack_num, r_payload_len, r_payload=parsed_response[1:]
-        # setReceivedACK(r_ack_num)       
-        setTime(parseTime(r_payload))
-        # Mark packets correctly received (if any) and remove them from buffer
-        # Expecting cumulative acks
-        # If ack is received including the base, disable timeout
-        expected_base_ack=next(iter(packet_buffer))
-        print("[{}]: Base seq: {}, Expected ACK num: {}".format(current_thread().name, packet_buffer[expected_base_ack][0], expected_base_ack))
-        print("[{}]: Parsed ACK num: {}".format(current_thread().name, r_ack_num))
-        if(expected_base_ack==r_ack_num):
-          # sock.settimeout(None)
-          # isFirstPacket=True
-          del packet_buffer[r_ack_num]
-          packetsSent-=1
-          if(queueNotEmpty):
-            keepSending=True
-        elif(r_ack_num in packet_buffer):
-          del packet_buffer[r_ack_num]
-          packetsSent-=1
-      # If packet_buffer is empty all packets are sent, reset state
-      if(not queueNotEmpty and not packet_buffer):
-        # print("[{}]: No buffered packet".format(current_thread().name))
-        while(True):
-          try:
-            sock.sendto(EMPTY_PACKET, send_addr)
-            # sock.settimeout(0.1) # in seconds
+        if(packetsToSend or not self.isWindowEmpty()):
+          # print("[{}]: Waiting for a response...".format(self.getName()))
+          parsed_response = self.getResponse()
+          if(parsed_response is None):
+            continue
+          # Extract information from the packet
+          r_seq_num, r_ack_num, r_payload_len, r_payload=parsed_response
+          # print("[{}]: Retrieved ACK: {}".format(self.getName(), r_ack_num))
+          # Update time
+          setTime(parseTime(r_payload))
+          # Mark the packet correctly received and stop its timer
+          self.getACK(r_ack_num)
+        # If packet_buffer is empty all packets are sent, reset state
+        if(not packetsToSend and self.isWindowEmpty()):
+          # print("[{}]: No buffered packet".format(current_thread().name))
+          while(True):
+            self.sendPacket(EMPTY_PACKET)
             # print("[{}]: Waiting an empty packet".format(current_thread().name))
-            response=sock.recv(HEADER_SIZE)
-            if(response==EMPTY_PACKET):
+            isEmpty = self.getEmptyPacket()
+            if(isEmpty):
               break
-          except timeout:
-            pass
-        print("[{}]: Transmission completed".format(current_thread().name))
-        print("[{}]: Before barrier".format(current_thread().name))
-        completed.wait()
-        packetsSent = 0
-        allPacketsSent = 0
-        queueNotEmpty=True
-        keepSending=True
-        isFirstPacket=True
-        base_seq=0
-        next_window_seq=0
-        expected_base_ack=0
-        print("[{}]: After barrier".format(current_thread().name))
-    # EVENT 3: Timeout
-    except timeout:
-        expected_base_ack=next(iter(packet_buffer))
-        print("[{}]: Event 3: Timeout triggered, resending the packet due to base_ack: {}".format(current_thread().name, expected_base_ack))
-        packet=packet_buffer[expected_base_ack][1]
-        # Send packet
-        sock.sendto(packet, send_addr)
-        # sock.settimeout(0.1)# in seconds
-  #     except Exception as e:
-  #       print("[{}]: EXCEPTION1: {}".format(current_thread().name, e))
+          # print("[{}]: Transmission completed, waiting for other threads...".format(current_thread().name))
+          self.barrier.wait()
+          packetsToSend=True
+          self.reset()
+          # print("[{}]: State is reset.".format(current_thread().name))
+      # except Exception as e:
+      #   print("[{}]: EXCEPTION1: {}".format(current_thread().name, e))
+
+threads=[]
+
+# def placePacket(thread_id, expected_ack_num, packet):
+#   if thread_id!=1 or thread_id!=2:
+#     print("Error in packet insertion")
+#     return
+#   threads[thread_id].enqueue(expected_ack_num, packet)
+
+# def slideWindow(thread_id):
+#   threads[thread_id].slideWindow()
+
+# def printState():
+#   keys=list(packet_buffer.keys())
+#   print("[{}]: Packet buffer keys: {}, length:{}".format(current_thread().name,keys,len(keys)))
+#   print("[{}]: Largest ACK number: {}".format(current_thread().name,largest_ack_obtained))
+#   print("[{}]: Start time: {}".format(current_thread().name,start_time))
+#   print("[{}]: End time: {}".format(current_thread().name,end_time))
+
+# def setReceivedACK(ack):
+#   global largest_ack_obtained
+#   with shared_largest_ack_lock:
+#     if(ack>largest_ack_obtained):
+#       largest_ack_obtained=ack
+
+
+# def router_handler(context, stop, , ):
+#   global ack_num
+#   print('[{}]: Listening to port:{}/{}'.format(current_thread().name, *context.getSocket().getsockname()))
+  # sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)# TODO: remove later
+  # ack_num = 0
+  # packet_buffer=OrderedDict()
+  
   # except Exception as e:
   #   print("EXCEPTION2:",e)
   # finally:
@@ -179,15 +300,19 @@ def router_handler(listen_addr, send_addr, stop, completed, queue):
   #   print("[{}]: Socket is closed.".format(current_thread().name))
 
 def main(argv):
-    global D_TH1_IP, D_TH1_PORT, D_TH2_IP, D_TH2_PORT, start_time, end_time
+    global threads, interrupt_count,\
+           D_TH1_IP, D_TH1_PORT,\
+           D_TH2_IP, D_TH2_PORT,\
+           start_time, end_time
+    # timerHandler is bound to SIGALRM interrupt to create timer interrupts
+    signal(SIGALRM, timerHandler)
     # Create a TCP/IP socket
     socketTCP = socket(AF_INET, SOCK_STREAM)
-    # Used for selection of routers randomly
-    # seed(None)
     # Define IP & port number of the server
     B_MAIN_IP='10.10.1.2'
     B_TH1_IP='10.10.2.1'
     B_TH2_IP='10.10.4.1'
+    # Run at localhost for testing purposes
     if(len(argv)>0):
       R_IP=argv[0]
       if(R_IP.lower()=="localhost"):
@@ -196,8 +321,6 @@ def main(argv):
         B_TH2_IP=LOCALHOST
         D_TH1_IP=LOCALHOST
         D_TH2_IP=LOCALHOST
-        D_TH1_PORT=5000
-        D_TH2_PORT=5001
     # Communicate with source
     TCP_source_PORT = 10000
     # Communicate with router-1
@@ -205,31 +328,36 @@ def main(argv):
     # Communicate with router-2
     UDP_router_PORT2 = 10002 
     # Address of B that s will use
-    TCP_addr = (B_MAIN_IP, TCP_source_PORT)
+    TCP_addr = [B_MAIN_IP, TCP_source_PORT]
     # Addresses of B that router-1 & router-2 will use
     b_th_addrs = [(B_TH1_IP, UDP_router_PORT1), (B_TH2_IP, UDP_router_PORT2)]
     # Addresses for link-1 (r1), link-3 (r2)
     d_th_addrs = [(D_TH1_IP, D_TH1_PORT), (D_TH2_IP, D_TH2_PORT)]
-    print('[MAIN THREAD]: Starting TCP server on {} port {}'.format(*TCP_addr))
     # Bind the sockets to the ports
     i=0
     while True:
       try:
         socketTCP.bind((B_MAIN_IP, TCP_source_PORT+i))
-        print("WARNING: Opened port:", TCP_source_PORT+i)
+        TCP_addr[1]=TCP_source_PORT+i
         break
       except OSError:
+        print("WARNING: Port couldn't be opened. Probing for an available port...")
         i+=1
+    print('[MAIN THREAD]: Starting TCP server on {} port {}'.format(*TCP_addr))
     # Enable listening at most one connection
     socketTCP.listen(1)
     # Initialize and start threads
-    stop_threads = Event()
-    q1=Queue(3000)
-    q2=Queue(3000)
-    queues=[q1, q2]
-    threads_completed=Barrier(3)
-    r1_worker_thread=Thread(target=router_handler, args=(b_th_addrs[0], d_th_addrs[0], stop_threads, threads_completed, q1)) # TODO: Uncomment
-    r2_worker_thread=Thread(target=router_handler, args=(b_th_addrs[1], d_th_addrs[1], stop_threads, threads_completed, q2)) # TODO: Uncomment
+    sock1=socket(AF_INET, SOCK_DGRAM)
+    sock2=socket(AF_INET, SOCK_DGRAM)
+    sock1.bind(b_th_addrs[0])
+    sock2.bind(b_th_addrs[1])
+    # stop_threads = Event()
+    queues=[Queue(3000), Queue(3000)]
+    barrier=Barrier(3)
+    r1_worker_thread=BrokerThread(sock1, d_th_addrs[0], barrier, queues[0]) # TODO: Uncomment
+    r2_worker_thread=BrokerThread(sock2, d_th_addrs[1], barrier, queues[1]) # TODO: Uncomment
+    threads.append(r1_worker_thread)
+    threads.append(r2_worker_thread)
     r1_worker_thread.start() # TODO: Uncomment
     r2_worker_thread.start() # TODO: Uncomment
     connection_socket = None
@@ -244,11 +372,15 @@ def main(argv):
           connection_socket, client_address = socketTCP.accept()
           start_time=time()
           print('[MAIN THREAD]: Connection from ip:{} on port number:{}'.format(*client_address))
+          # Decrement interval timer in real time, and deliver SIGALRM upon expiration.
+          # Start timer after 50 ms
+          # Call handler in every TIMER_PERIOD seconds
+          setitimer(ITIMER_REAL, 0.05, TIMER_PERIOD)
           seq_num=0
           packets_forwarded=0
           # bytes_received_in_total=0
           while True:
-            #Receive the message boundary for the packet first
+            # Receive the message size/boundary for the packet first
             initialBytesToRead = SOURCE_SMALL_PACKET_SIZE
             bytesToRead = bytes()
             while(initialBytesToRead):
@@ -264,34 +396,28 @@ def main(argv):
                 queues[1].put_nowait((None, None, None))
                 print("[MAIN THREAD]: {} packets forwarded. Waiting for both threads to complete...".format(packets_forwarded))
                 # print("[MAIN THREAD]: Total number of bytes received from the source:",bytes_received_in_total) 
-                threads_completed.wait()
-                threads_completed.reset()
-                print("[MAIN THREAD]: Start time of upload:", start_time)
-                print("[MAIN THREAD]: End time of upload:", end_time)
+                barrier.wait()
+                barrier.reset()
+                setitimer(ITIMER_REAL, 0, 0)
+                # print("[MAIN THREAD]: Start time of upload:", start_time)
+                # print("[MAIN THREAD]: End time of upload:", end_time)
                 print("[MAIN THREAD]: Duration of upload:", end_time-start_time)
-                connection_socket.sendall(pack('d', end_time))
-                #TODO: remove later
                 start_time=0
                 end_time=0
                 seq_num=0
                 break
-                # ack_num=0
-                # largest_ack_obtained=0
-                # connected=False
-                # printState()
+            # Reading payload with respect to size defined in the earlier message
             payload_size = bytesToRead = int.from_bytes(bytesToRead, byteorder='little')
             payload = bytes()
             while(bytesToRead):
               read = connection_socket.recv(bytesToRead)
               bytesToRead -= len(read)
               payload += read
-            # Get how many bytes read from file
             # print("Payload size:", payload_size)
             # bytes_received_in_total+=payload_size
+            # print("Interrupt count:", interrupt_count)
             # Create packet
             packet = packetize(seq_num, ack_num, payload_size, payload)
-            # Keep the expected ack number(same thing as next seq_num) along with the packet just sent 
-            # packet_buffer[seq_num]=packet
             # Find next sequence number
             expected_ack = seq_num + payload_size
             # Send packet via one of the threads
