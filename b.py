@@ -25,9 +25,9 @@ start_time = 0
 end_time = 0
 shared_time_lock = Lock()
 # Timer handler is called in every TIMER_PERIOD seconds
-TIMER_PERIOD = 0.01
+TIMER_PERIOD = 0.1
 # Timeout takes place every "TIMEOUT_PERIOD"th enterance to the handler 
-TIMEOUT_PERIOD = 3
+TIMEOUT_PERIOD = 7
 # (TIMER_PERIOD*TIMEOUT_PERIOD seconds is the timeout value)
 interrupt_count=0
 th1_timerLock = Lock()
@@ -125,28 +125,34 @@ class BrokerThread(Thread):
 
   # Send packet in the window, used for resending the packet (Called only by main thread)
   def sendPacketFromWindow(self, index):
-    print("[{}]: Retransmission of packet with expected ACK: {}".format(self.getName(), self.expected_acks[index]))
-    self.sendPacket(self.packets[index])
-    self.startTimer(index)
-
-  # Send the packet (SHARED with main thread)
-  def sendPacket(self, packet, send_addr=None):
+    sending=True
     with self.timerLock:
-      # print("[{}]: sendPacket-Lock held".format(self.getName()))
-      if(not send_addr):
-        send_addr=self.send_addr
-      # Handle the case where the retransmitted packet is removed just before the timeout
-      if(packet):
-        self.sock.sendto(packet, send_addr)
-    # print("[{}]: sendPacket-Lock released".format(self.getName()))
+      # print("[{}]: Retransmission of packet with expected ACK: {}".format(self.getName(), self.expected_acks[index]))
+      # Handling the cases where the retransmitted packet is removed just before the timeout
+      packet=self.packets[index]
+      ack=self.expected_acks[index]
+      sending = (ack!=True) and (packet!=None)
+      if(sending):
+        self.sock.sendto(packet, self.send_addr)
+    if(sending):
+      self.startTimer(index)
+
+  # Send the packet
+  def sendPacket(self, packet, send_addr=None):
+    if(not send_addr):
+      send_addr=self.send_addr
+    self.sock.sendto(packet, send_addr)
 
   # When one TIMER_PERIOD is passed, update all active timers and resend timed-out packets (Called only by main thread)
   def tickAll(self):
-    global WINDOW_SIZE
-    for i in range(WINDOW_SIZE):
-      self.tick(i)
-      if(self.timers[i]==0):
-        self.sendPacketFromWindow(i)
+    try:
+      global WINDOW_SIZE
+      for i in range(WINDOW_SIZE):
+        self.tick(i)
+        if(self.timers[i]==0):
+          self.sendPacketFromWindow(i)
+    except RuntimeError:
+      pass
 
   # Enqueue
   def enqueue(self, expected_ack, packet):
