@@ -6,60 +6,13 @@ from packet import *
 from ntp import *
 from select import *
 
-# ready_buffer = {}
 packet_buffer = {}
 buffer_lock=Lock()
 seq_num = 0
 shared_number_lock=Lock()
-# largest_ack_given=0
-# shared_largest_ack_lock=Lock()
+NTP_OFFSET=0
 
-def printState():
-  # keys=list(ready_buffer.keys())
-  # print("Ready buffer keys: {}, length:{}".format(keys,len(keys)))
-  keys=list(packet_buffer.keys())
-  print("Packet buffer keys: {}, length:{}".format(keys,len(keys)))
-  # print("Sequence number: {}".format(seq_num))
-
-# def setGivenACK(ack):
-#   global largest_ack_given
-#   if(ack>largest_ack_given):
-#     largest_ack_given=ack
-
-# TODO: correct this function
-# def checkGap():
-#   try:
-#     with buffer_lock:
-#       gap_exists=False
-#       sorted_seq_nums=sorted(packet_buffer.keys())
-#       with shared_largest_ack_lock:
-#         if(largest_ack_given!=sorted_seq_nums[0]):
-#           return (-1, gap_exists)
-#       number_of_packets=len(sorted_seq_nums)
-#       number_of_iterations=number_of_packets-1
-#       i=0
-#       # print("{} in checkGap {}".format(current_thread().name,sorted_seq_nums))
-#       while(i<number_of_iterations):
-#         seq_num1 = sorted_seq_nums[i]
-#         pay_len = packet_buffer[seq_num1][1]
-#         seq_num2 = sorted_seq_nums[i+1]
-#         if(seq_num1+pay_len!=seq_num2):
-#           gap_exists=True
-#           break
-#         ready_buffer[seq_num1]=packet_buffer[seq_num1][0]
-#         del packet_buffer[seq_num1]
-#         i+=1
-#       if(i<number_of_packets):
-#         seq=sorted_seq_nums[i]
-#         ack_num=(seq+packet_buffer[seq][1]) % MAX_ALLOWED_SEQ_NUM
-#         ready_buffer[seq]=packet_buffer[seq][0]
-#         del packet_buffer[seq]
-#         return (ack_num, gap_exists)
-#       return (-1, gap_exists)
-#   except Exception as e:
-#     print("[{}]: EXCEPTION IN checkGap: {}".format(current_thread().name,e)) 
-
-
+# Place packet on the shared buffer
 def storePacketOnBuffer(seq_num, payload, pay_len):
   with buffer_lock:
     # print("{} in storePacketOnBuffer inserting {}".format(current_thread().name, seq_num))
@@ -69,6 +22,7 @@ def storePacketOnBuffer(seq_num, payload, pay_len):
     else:
       print("[{}]: Retransmission of {} ignored.".format(current_thread().name, seq_num))
 
+# Main thread sorts packets on the shared buffer and stores on "output.txt"
 def reconstructAndSave():
   if(packet_buffer):
     print("Saving file...")
@@ -78,10 +32,13 @@ def reconstructAndSave():
         file.write(packet_buffer[seq_num])
     packet_buffer.clear()
 
+# Worker threads prepare responses
+# It needs to take and update seq_num
+# and put timestamp on payload
 def prepareResponse(ack_num):
   global seq_num
   # Epoch time related calculations 
-  integer, fraction = str(time()).split('.')
+  integer, fraction = str(time()-NTP_OFFSET).split('.')
   integer=convertBytesOfLength(int(integer), MAX_INTEGER)
   fraction=convertBytesOfLength(int(fraction), MAX_DECIMAL)
   payload='.'.encode()
@@ -95,6 +52,7 @@ def prepareResponse(ack_num):
     seq_num=seq_num + payload_len
   return response
 
+# Worker thread implementation
 def router_handler(addr, completed):
   sock = socket(AF_INET, SOCK_DGRAM)
   sock.bind(addr)
@@ -123,6 +81,7 @@ def router_handler(addr, completed):
           ack_num = 0
           packets_received=0
         continue
+      # Otherwise
       packets_received+=1
       r_seq_num, r_ack_num, r_payload_len, r_payload=parsed[1:]
       print("[{}]: Retrieved packet: {}".format(current_thread().name, r_seq_num))
@@ -140,17 +99,21 @@ def router_handler(addr, completed):
     print("[{}]: Socket is closed.".format(current_thread().name))
 
 def main(argv):
+  global NTP_OFFSET, seq_num
   # Define IP & port number of the server
   TH1_IP = '10.10.3.2'
   TH2_IP = '10.10.5.2'
   argc=len(argv)
   if(argc>0):
-    TH1_IP=''
-    TH2_IP=''
-  UDP_TH1_PORT = 5000 # Communicate with r1
-  UDP_TH2_PORT = 5001 # Communicate with r2
-  UDP_addr1 = (TH1_IP, UDP_TH1_PORT) # Address of d (main thread) that r1 will use
-  UDP_addr2 = (TH2_IP, UDP_TH2_PORT) # Address of d (worker thread) that r2 will use
+    if("--localhost" in argv):
+      TH1_IP=''
+      TH2_IP=''
+    if("--ntp" in argv):
+      NTP_OFFSET=getNTPTime()
+  UDP_TH1_PORT = 5000 # Communicate with thread-1 of broker
+  UDP_TH2_PORT = 5001 # Communicate with thread-2 of broker
+  UDP_addr1 = (TH1_IP, UDP_TH1_PORT) # Address of thread-1 that thread-1 of broker will use
+  UDP_addr2 = (TH2_IP, UDP_TH2_PORT) # Address of thread-2 that thread-2 of broker will use
   # Initialize and start threads
   completed=Barrier(3)
   th1=Thread(target=router_handler, args=(UDP_addr1, completed))
@@ -159,14 +122,11 @@ def main(argv):
   th2.start()
   try:
     while True:
+      # Wait barrier
       completed.wait()
       reconstructAndSave()
-      # seq_num = 0
-      # ack_num = 0
-      # packets_received=0
-      # receiving=True
-      # gap_exists=True
-      # largest_ack_given=0
+      seq_num = 0
+      # Reset barrier
       completed.reset()
   except Exception as e:
     print("[{}]: EXCEPTION: {}".format(current_thread().name,e))    

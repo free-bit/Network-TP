@@ -1,13 +1,11 @@
 from sys import argv
-from random import seed, randint
-from collections import OrderedDict
-from struct import pack, unpack
 from time import *
 from socket import *
 from threading import *
 from queue import *
-from packet import *
 from signal import *
+from packet import *
+from ntp import *
 
 # TODO: create a proper indexing mechanism for packets sent
 
@@ -17,6 +15,7 @@ D_TH1_IP='10.10.3.2'
 D_TH1_PORT=5000
 D_TH2_IP='10.10.5.2'
 D_TH2_PORT=5001
+NTP_OFFSET=0
 SOURCE_SMALL_PACKET_SIZE=3
 # Define max number of pipelining
 WINDOW_SIZE=30
@@ -24,25 +23,56 @@ WINDOW_SIZE=30
 start_time = 0
 end_time = 0
 shared_time_lock = Lock()
+
+EMPTY_LIST=[None]*WINDOW_SIZE
 # Timer handler is called in every TIMER_PERIOD seconds
-TIMER_PERIOD = 0.1
+TIMER_PERIOD = 0.25
 # Timeout takes place every "TIMEOUT_PERIOD"th enterance to the handler 
-TIMEOUT_PERIOD = 7
+TIMEOUT_PERIOD = 3
 # (TIMER_PERIOD*TIMEOUT_PERIOD seconds is the timeout value)
 interrupt_count=0
-th1_timerLock = Lock()
-th2_timerLock = Lock()
+sockets=None
+buffers=None
+timers=None
+send_addrs=None
+
+# Try to update the timer, if it is not set do nothing (Called only by main thread)
+def tick(thread_id, index):
+  global timers
+  try:
+    timers[thread_id][index]-=1
+  except TypeError:
+    pass
+
+# Send packet in the window, used for resending the packet (Called only by main thread)
+def sendPacketFromWindow(thread_id, index):
+  global sockets, buffers, send_addrs
+  try:
+    sockets[thread_id].sendto(buffers[thread_id][index], send_addrs[thread_id])
+    timers[thread_id][index]=TIMEOUT_PERIOD
+    print("[{}]: Retransmission of a packet".format(current_thread().name))
+  # The acknowledgment has just received
+  except TypeError:
+    pass
+
+# When one TIMER_PERIOD is passed, update all active timers and resend timed-out packets (Called only by main thread)
+def tickAll(thread_id):
+  global WINDOW_SIZE, timers
+  for i in range(WINDOW_SIZE):
+    tick(thread_id, i)
+    if(timers[thread_id][i]==0):
+      sendPacketFromWindow(thread_id, i)
 
 # Only the main thread enters the handler
 def timerHandler(signum, _):
-  global th1_timerLock, th2_timerLock
   # global interrupt_count
   # Update thread-1 timer context, take action if time is out
-  threads[0].tickAll()
+  tickAll(0)
   # Update thread-2 timer context, take action if time is out
-  threads[1].tickAll()
+  tickAll(1)
   # interrupt_count+=1
 
+# Parses timestamp information in payload of the message
 def parseTime(payload):
   if(payload):
     integer=str(int.from_bytes(payload[:MAX_INTEGER], byteorder='little'))
@@ -51,30 +81,32 @@ def parseTime(payload):
     return epoch
   return None
 
+# Used for updating file transfer time
 def setTime(record):
   global end_time
   if(record):
     with shared_time_lock:
       if(record>end_time):
         end_time=record
-
+# Broker worker threads
 class BrokerThread(Thread):
-  def __init__(self, sock, send_addr, barrier, queue, timerLock):
+  def __init__(self, self_id, barrier, queue):
+    global sockets, buffers, timers, send_addrs
     super(BrokerThread, self).__init__()
+    # Using shared global scope variables
+    self.sock = sockets[self_id]
+    self.packets = buffers[self_id]
+    self.timers = timers[self_id]
+    self.send_addr = send_addrs[self_id]
     # Provided by main
-    self.sock = sock
-    self.send_addr = send_addr
     self.barrier=barrier
     self.shared_queue=queue
-    self.timerLock = timerLock
-    # Thread local context which has to be reset at every new connection
+    # Thread local context
     # Possible expected ack values: 
       # None: No ACK is expected
       # True: ACK is already received,
       # Float: Specified ACK is expected
-    self.expected_acks=[None]*WINDOW_SIZE
-    self.packets = [None]*WINDOW_SIZE
-    self.timers = [None]*WINDOW_SIZE
+    self.expected_acks=EMPTY_LIST[:]
     self.windowBase = 0
     self.windowNext = WINDOW_SIZE-1
     self.isFull=False
@@ -99,60 +131,19 @@ class BrokerThread(Thread):
 
   # Set/start timeout for the packet with provided index (SHARED with main thread)
   def startTimer(self, index=None):
-    with self.timerLock:
-      # print("[{}]: startTimer-Lock held".format(self.getName()))
-      if(not index):
-        index=self.windowNext
-      self.timers[index]=TIMEOUT_PERIOD
-    # print("[{}]: startTimer-released".format(self.getName()))
+    if(not index):
+      index=self.windowNext
+    self.timers[index]=TIMEOUT_PERIOD
 
   # Disable timeout for the packet with provided index (Not shared but timer value changes)
   def stopTimer(self, index):
-    with self.timerLock:
-      # print("[{}]: stopTimer-Lock held".format(self.getName()))
-      self.timers[index]=None
-    # print("[{}]: stopTimer-Lock released".format(self.getName()))
-
-  # Try to update the timer, if it is not set do nothing (Called only by main thread)
-  def tick(self, index):
-    with self.timerLock:
-      # print("[{}]: tick-Lock held".format(self.getName()))
-      try:
-        self.timers[index]-=1
-      except TypeError:
-        pass
-    # print("[{}]: tick-Lock released".format(self.getName()))
-
-  # Send packet in the window, used for resending the packet (Called only by main thread)
-  def sendPacketFromWindow(self, index):
-    sending=True
-    with self.timerLock:
-      # print("[{}]: Retransmission of packet with expected ACK: {}".format(self.getName(), self.expected_acks[index]))
-      # Handling the cases where the retransmitted packet is removed just before the timeout
-      packet=self.packets[index]
-      ack=self.expected_acks[index]
-      sending = (ack!=True) and (packet!=None)
-      if(sending):
-        self.sock.sendto(packet, self.send_addr)
-    if(sending):
-      self.startTimer(index)
+    self.timers[index]=None
 
   # Send the packet
   def sendPacket(self, packet, send_addr=None):
     if(not send_addr):
       send_addr=self.send_addr
     self.sock.sendto(packet, send_addr)
-
-  # When one TIMER_PERIOD is passed, update all active timers and resend timed-out packets (Called only by main thread)
-  def tickAll(self):
-    try:
-      global WINDOW_SIZE
-      for i in range(WINDOW_SIZE):
-        self.tick(i)
-        if(self.timers[i]==0):
-          self.sendPacketFromWindow(i)
-    except RuntimeError:
-      pass
 
   # Enqueue
   def enqueue(self, expected_ack, packet):
@@ -198,7 +189,7 @@ class BrokerThread(Thread):
     global WINDOW_SIZE
     count=0
     new_base=self.windowBase
-    while self.expected_acks[new_base]==True:
+    while self.expected_acks[new_base]==True and count<WINDOW_SIZE:
       new_base=(new_base+1)%WINDOW_SIZE
       count+=1
     return count
@@ -224,12 +215,12 @@ class BrokerThread(Thread):
 
   # Reset state to initial configuration
   def reset(self):
-    self.expected_acks=[None]*WINDOW_SIZE
-    self.packets = [None]*WINDOW_SIZE
-    self.timers = [None]*WINDOW_SIZE
-    self.windowBase = 0
-    self.windowNext = WINDOW_SIZE-1
-    self.isFull = False
+    self.packets[:]       = EMPTY_LIST
+    self.timers[:]        = EMPTY_LIST
+    self.expected_acks[:] = EMPTY_LIST
+    self.windowBase       = 0
+    self.windowNext       = WINDOW_SIZE-1
+    self.isFull           = False
 
   # Thread loop
   def run(self):
@@ -263,7 +254,7 @@ class BrokerThread(Thread):
             continue
           # Extract information from the packet
           r_seq_num, r_ack_num, r_payload_len, r_payload=parsed_response
-          # print("[{}]: Retrieved ACK: {}".format(self.getName(), r_ack_num))
+          print("[{}]: Retrieved ACK: {}".format(self.getName(), r_ack_num))
           # Update time
           setTime(parseTime(r_payload))
           # Mark the packet correctly received and stop its timer
@@ -275,26 +266,25 @@ class BrokerThread(Thread):
             self.sendPacket(EMPTY_PACKET)
             self.enqueue(0, EMPTY_PACKET)
             self.startTimer()
-            # print("[{}]: Waiting an empty packet".format(current_thread().name))
+            print("[{}]: Waiting an empty packet...".format(current_thread().name))
             isEmpty = self.getEmptyPacket()
             if(isEmpty):
               break
-          # print("[{}]: Transmission completed, waiting for other threads...".format(current_thread().name))
+          print("[{}]: Transmission completed, waiting for other thread...".format(current_thread().name))
+          self.reset()
           self.barrier.wait()
           packetsToSend=True
-          self.reset()
           # print("[{}]: State is reset.".format(current_thread().name))
       # except Exception as e:
       #   print("[{}]: EXCEPTION1: {}".format(current_thread().name, e))
 
-threads=[]
-
 def main(argv):
-    global threads, interrupt_count,\
-           th1_timerLock, th2_timerLock,\
+    global NTP_OFFSET,interrupt_count,\
            D_TH1_IP, D_TH1_PORT,\
            D_TH2_IP, D_TH2_PORT,\
-           start_time, end_time
+           start_time, end_time,\
+           sockets, buffers,\
+           timers, send_addrs
     # timerHandler is bound to SIGALRM interrupt to create timer interrupts
     signal(SIGALRM, timerHandler)
     # Create a TCP/IP socket
@@ -303,15 +293,17 @@ def main(argv):
     B_MAIN_IP='10.10.1.2'
     B_TH1_IP='10.10.2.1'
     B_TH2_IP='10.10.4.1'
-    # Run at localhost for testing purposes
-    if(len(argv)>0):
-      R_IP=argv[0]
-      if(R_IP.lower()=="localhost"):
+    argc=len(argv)
+    if(argc>0):
+      # Run at localhost for testing purposes
+      if("--localhost" in argv):
         B_MAIN_IP=LOCALHOST
         B_TH1_IP=LOCALHOST
         B_TH2_IP=LOCALHOST
         D_TH1_IP=LOCALHOST
         D_TH2_IP=LOCALHOST
+      if("--ntp" in argv):
+        NTP_OFFSET=getNTPTime()
     # Communicate with source
     TCP_source_PORT = 10000
     # Communicate with router-1
@@ -323,7 +315,7 @@ def main(argv):
     # Addresses of B that router-1 & router-2 will use
     b_th_addrs = [(B_TH1_IP, UDP_router_PORT1), (B_TH2_IP, UDP_router_PORT2)]
     # Addresses for link-1 (r1), link-3 (r2)
-    d_th_addrs = [(D_TH1_IP, D_TH1_PORT), (D_TH2_IP, D_TH2_PORT)]
+    send_addrs = [(D_TH1_IP, D_TH1_PORT), (D_TH2_IP, D_TH2_PORT)]
     # Bind the sockets to the ports
     i=0
     while True:
@@ -342,15 +334,15 @@ def main(argv):
     sock2=socket(AF_INET, SOCK_DGRAM)
     sock1.bind(b_th_addrs[0])
     sock2.bind(b_th_addrs[1])
-    # stop_threads = Event()
+    sockets=[sock1, sock2]
+    buffers=[EMPTY_LIST[:], EMPTY_LIST[:]]
+    timers=[EMPTY_LIST[:], EMPTY_LIST[:]]
     queues=[Queue(3000), Queue(3000)]
     barrier=Barrier(3)
-    r1_worker_thread=BrokerThread(sock1, d_th_addrs[0], barrier, queues[0], th1_timerLock) # TODO: Uncomment
-    r2_worker_thread=BrokerThread(sock2, d_th_addrs[1], barrier, queues[1], th2_timerLock) # TODO: Uncomment
-    threads.append(r1_worker_thread)
-    threads.append(r2_worker_thread)
-    r1_worker_thread.start() # TODO: Uncomment
-    r2_worker_thread.start() # TODO: Uncomment
+    r1_worker_thread=BrokerThread(0, barrier, queues[0])
+    r2_worker_thread=BrokerThread(1, barrier, queues[1])
+    r1_worker_thread.start()
+    r2_worker_thread.start()
     connection_socket = None
     seq_num=0
     ack_num=0
@@ -361,7 +353,7 @@ def main(argv):
         print('[MAIN THREAD]: Waiting for a connection...')
         # New TCP socket is opened and named as "connection_socket"
         connection_socket, client_address = socketTCP.accept()
-        start_time=time()
+        start_time=time()-NTP_OFFSET
         print('[MAIN THREAD]: Connection from ip:{} on port number:{}'.format(*client_address))
         # Decrement interval timer in real time, and deliver SIGALRM upon expiration.
         # Start timer after 50 ms
@@ -369,7 +361,6 @@ def main(argv):
         setitimer(ITIMER_REAL, 0.05, TIMER_PERIOD)
         seq_num=0
         packets_forwarded=0
-        # bytes_received_in_total=0
         while True:
           # Receive the message size/boundary for the packet first
           initialBytesToRead = SOURCE_SMALL_PACKET_SIZE
@@ -380,8 +371,7 @@ def main(argv):
               break
             initialBytesToRead -= len(read)
             bytesToRead += read
-          # print("Size of reading:",len(bytesToRead))
-          # print("Value of reading:", bytesToRead)
+          # Connection with s is over
           if(len(bytesToRead)==0):
               queues[0].put_nowait((None, None, None))
               queues[1].put_nowait((None, None, None))
@@ -404,15 +394,12 @@ def main(argv):
             read = connection_socket.recv(bytesToRead)
             bytesToRead -= len(read)
             payload += read
-          # print("Payload size:", payload_size)
-          # bytes_received_in_total+=payload_size
-          # print("Interrupt count:", interrupt_count)
           # Create packet
           packet = packetize(seq_num, ack_num, payload_size, payload)
           # Find next sequence number
           expected_ack = seq_num + payload_size
           # Send packet via one of the threads
-          selection=packets_forwarded%2 # TODO: Use randint later 
+          selection=packets_forwarded%2
           queues[selection].put_nowait((seq_num, expected_ack, packet))
           seq_num = expected_ack
           packets_forwarded+=1
@@ -426,8 +413,8 @@ def main(argv):
     #       connection_socket.close()
     #     # Close the sockets
     #     socketTCP.close()
-    #     r1_worker_thread.join() # TODO: Uncomment
-    #     r2_worker_thread.join() # TODO: Uncomment
+    #     r1_worker_thread.join()
+    #     r2_worker_thread.join()
     #     sock1.close()
     #     sock2.close()
     #     print("[MAIN THREAD]: Sockets are closed.")
